@@ -25,9 +25,15 @@ self.onmessage = async (e: MessageEvent) => {
 
     // 2. 将前端传入的图片 URL 转为 ImageData 并载入成 OpenCV 的 Mat 矩阵
     const imgData = await fetchImageData(imageSrc);
-    let src = cv.matFromImageData(imgData);
-    let h = src.rows;
-    let w = src.cols;
+    let rgba = cv.matFromImageData(imgData);
+    let h = rgba.rows;
+    let w = rgba.cols;
+    
+    // 【关键修复】将 RGBA 转为 BGR，与 Python cv2.imread 的 BGR 格式一致
+    // 这样后续 cv.split 得到的顺序就是 B=0, G=1, R=2
+    let src = new cv.Mat();
+    cv.cvtColor(rgba, src, cv.COLOR_RGBA2BGR);
+    rgba.delete(); // 释放 RGBA 矩阵
     
     // 3. 根据手机屏幕分辨率动态计算人因工程制图参数
     const dynRadius = Math.max(5, Math.floor(w / 150));      
@@ -129,10 +135,9 @@ function runV28(src: any, w: number, h: number, minAngle: number) {
   cv.subtract(r, g, rgDiff);
   cv.subtract(r, b, rbDiff);
   
-  // HSV 颜色空间（V28 后两层使用）
+  // HSV 颜色空间（V28 后两层使用）—— src 是 BGR 格式
   let hsv = new cv.Mat();
-  cv.cvtColor(src, hsv, cv.COLOR_RGBA2RGB);
-  cv.cvtColor(hsv, hsv, cv.COLOR_RGB2HSV);
+  cv.cvtColor(src, hsv, cv.COLOR_BGR2HSV);
   
   const cascadeThresholds = [
     // 3 层 RGB（阈值比 V27 宽松）
@@ -440,9 +445,19 @@ async function fetchImageData(url: string): Promise<ImageData> {
 }
 
 function matToImageData(mat: any): ImageData {
-  let img = new cv.Mat();
-  cv.cvtColor(mat, img, cv.COLOR_BGRA2RGBA);
-  let imgData = new ImageData(new Uint8ClampedArray(img.data), img.cols, img.rows);
-  img.delete();
+  // src 现在是 BGR（3 通道），需要转成 RGBA（4 通道）供前端显示
+  let rgb = new cv.Mat();
+  cv.cvtColor(mat, rgb, cv.COLOR_BGR2RGB);
+  // 补充 Alpha 通道（全不透明）
+  let rgba = new cv.Mat(rgb.rows, rgb.cols, cv.CV_8UC4);
+  let planes = new cv.MatVector();
+  cv.split(rgb, planes);
+  let alpha = new cv.Mat(rgb.rows, rgb.cols, cv.CV_8UC1, new cv.Scalar(255));
+  planes.push_back(alpha);
+  cv.merge(planes, rgba);
+  let imgData = new ImageData(new Uint8ClampedArray(rgba.data), rgba.cols, rgba.rows);
+  rgb.delete(); rgba.delete(); alpha.delete();
+  for (let i = 0; i < planes.size(); i++) planes.get(i).delete();
+  planes.delete();
   return imgData;
 }
