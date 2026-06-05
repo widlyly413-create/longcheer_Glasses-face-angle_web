@@ -1,5 +1,5 @@
 // App.tsx
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 
 export default function App() {
@@ -8,10 +8,115 @@ export default function App() {
   const [status, setStatus] = useState<string>('等待载入眼镜图像');
   const [loading, setLoading] = useState<boolean>(false);
   const [userId, setUserId] = useState<string>('');
+  const [cameraActive, setCameraActive] = useState(false);
+  const [tiltAngle, setTiltAngle] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
 
-  // 当用户拍照或上传图片时触发
+  // 设备方向监听 - 水平仪
+  const handleOrientation = useCallback((event: DeviceOrientationEvent) => {
+    if (event.gamma !== null) {
+      setTiltAngle(event.gamma);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (cameraActive) {
+      // iOS 13+ 需要主动请求权限
+      if (typeof DeviceOrientationEvent !== 'undefined' &&
+          typeof (DeviceOrientationEvent as any).requestPermission === 'function') {
+        (DeviceOrientationEvent as any).requestPermission().then((state: string) => {
+          if (state === 'granted') {
+            window.addEventListener('deviceorientation', handleOrientation);
+          }
+        });
+      } else {
+        window.addEventListener('deviceorientation', handleOrientation);
+      }
+    }
+    return () => {
+      window.removeEventListener('deviceorientation', handleOrientation);
+    };
+  }, [cameraActive, handleOrientation]);
+
+  // 开启相机
+  const startCamera = async () => {
+    try {
+      setStatus('正在启动相机...');
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: 'environment',
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        }
+      });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+      setCameraActive(true);
+      setStatus('请将眼镜水平置于视野中心，轻触拍照');
+    } catch (err) {
+      console.error('Camera access denied:', err);
+      alert('⚠️ 无法访问相机，请确保已授予相机权限。\n将改用相册选择图片。');
+      fileInputRef.current?.click();
+    }
+  };
+
+  // 关闭相机
+  const stopCamera = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    setCameraActive(false);
+  };
+
+  // 从视频帧拍照
+  const capturePhoto = () => {
+    const video = videoRef.current;
+    if (!video || !video.videoWidth) return;
+
+    setLoading(true);
+    setStatus('正在进行人因测量分辨率优化...');
+    setAngleResult(null);
+
+    // 从视频帧截取
+    const capCanvas = document.createElement('canvas');
+    capCanvas.width = video.videoWidth;
+    capCanvas.height = video.videoHeight;
+    const capCtx = capCanvas.getContext('2d');
+    capCtx?.drawImage(video, 0, 0);
+
+    // 压缩到 MAX_WIDTH
+    const MAX_WIDTH = 1200;
+    let width = capCanvas.width;
+    let height = capCanvas.height;
+    if (width > MAX_WIDTH) {
+      height = Math.round((height * MAX_WIDTH) / width);
+      width = MAX_WIDTH;
+    }
+    const resizeCanvas = document.createElement('canvas');
+    resizeCanvas.width = width;
+    resizeCanvas.height = height;
+    const resizeCtx = resizeCanvas.getContext('2d');
+    resizeCtx?.drawImage(capCanvas, 0, 0, width, height);
+
+    const compressedDataUrl = resizeCanvas.toDataURL('image/jpeg', 0.85);
+    stopCamera();
+    setImageSrc(compressedDataUrl);
+    setStatus('图像优化完成，正在进行骨架级联解算...');
+    drawBaseImageToCanvas(compressedDataUrl);
+    runAnalysis(compressedDataUrl, userId);
+  };
+
+  // 当用户从相册选择图片时触发
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -25,7 +130,7 @@ export default function App() {
       const img = new Image();
       img.onload = () => {
         const canvas = document.createElement('canvas');
-        const MAX_WIDTH = 1200; // 匹配算法理想物理宽度约束
+        const MAX_WIDTH = 1200;
         let width = img.width;
         let height = img.height;
 
@@ -38,16 +143,11 @@ export default function App() {
         canvas.height = height;
         const ctx = canvas.getContext('2d');
         ctx?.drawImage(img, 0, 0, width, height);
-        
-        // 缩减传输基底体积
+
         const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.85);
         setImageSrc(compressedDataUrl);
         setStatus('图像优化完成，正在进行骨架级联解算...');
-
-        // 在主画布上初始化原图预览
         drawBaseImageToCanvas(compressedDataUrl);
-        
-        // 【需求4】拍照/选图后自动运行分析
         runAnalysis(compressedDataUrl, userId);
       };
       img.src = event.target?.result as string;
@@ -73,21 +173,18 @@ export default function App() {
   const runAnalysis = (src: string, uid: string) => {
     setLoading(true);
     setStatus('级联核心策略运行中...');
-    
-    // 初始化 Web Worker
+
     const worker = new Worker(new URL('./cv.worker.ts', import.meta.url));
     worker.postMessage({ imageSrc: src, userId: uid });
-    
-    // 监听 Worker 零拷贝传回的像素数据
+
     worker.onmessage = (e) => {
       const { success, angle, msg, version, rgbaData, width, height } = e.data;
       setLoading(false);
-      
+
       if (success) {
         setStatus(`测量成功！系统判别：${version}`);
         setAngleResult(angle);
-        
-        // 利用 Canvas 动态更新带骨架标记的结果图
+
         const canvas = canvasRef.current;
         if (canvas) {
           canvas.width = width;
@@ -115,8 +212,9 @@ export default function App() {
     };
   };
 
-  // 用户点击"重新拍照"清空状态
+  // 重新拍摄/返回
   const handleRetake = () => {
+    stopCamera();
     setImageSrc(null);
     setAngleResult(null);
     setStatus('等待载入眼镜图像');
@@ -131,12 +229,10 @@ export default function App() {
   const handleSave = () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    // 用 toBlob 获取高质量 JPEG
     canvas.toBlob((blob) => {
       if (!blob) return;
       const link = document.createElement('a');
       link.href = URL.createObjectURL(blob);
-      // 文件名：有编号用编号，否则用时间戳
       const timestamp = new Date().toISOString().slice(0, 19).replace(/[:-]/g, '');
       const fileName = userId ? `${userId}.jpg` : `face_angle_${timestamp}.jpg`;
       link.download = fileName;
@@ -147,13 +243,17 @@ export default function App() {
     }, 'image/jpeg', 0.95);
   };
 
+  // ========== 水平仪指示器 ==========
+  // gamma: -90（左倾）~ 0（水平）~ 90（右倾），映射为 -50%~50% 偏移
+  const levelPercent = Math.max(-50, Math.min(50, tiltAngle * 0.6));
+  const levelDotLeft = 50 + levelPercent;
+
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col justify-between p-4 font-sans select-none">
       {/* 状态看板 */}
       <div className="bg-white p-4 rounded-2xl shadow-sm text-center">
         <div className="flex items-center justify-between gap-2 mb-2">
           <h1 className="text-xl font-bold text-gray-800 tracking-wide">面弯角精密测量系统</h1>
-          {/* 【需求3】用户编号输入 */}
           <input
             type="text"
             placeholder="用户编号"
@@ -165,24 +265,87 @@ export default function App() {
         <p className={`text-xs font-medium ${loading ? 'text-blue-500 animate-pulse' : 'text-gray-400'}`}>{status}</p>
       </div>
 
-      {/* 【需求2】核心图形渲染区 - 自适应缩放 */}
+      {/* 核心图形渲染区 */}
       <div className="relative flex-1 my-4 bg-gray-900 rounded-3xl overflow-hidden flex items-center justify-center shadow-inner min-h-[300px]">
+        {/* 相机预览（优先于 canvas） */}
+        {cameraActive && (
+          <div className="relative w-full h-full flex items-center justify-center">
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted
+              className="w-full h-full object-cover"
+            />
+            {/* 靶心辅助线 */}
+            <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
+              {/* 外圈 */}
+              <div className="relative w-4/5 h-4/5 max-w-[300px] max-h-[300px]">
+                {/* 大圆环 */}
+                <div className="absolute inset-0 border-2 border-white/40 rounded-full"></div>
+                {/* 内圈 */}
+                <div className="absolute inset-[30%] border border-white/30 rounded-full"></div>
+                {/* 中心点 */}
+                <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-2 h-2 bg-white/70 rounded-full"></div>
+                {/* 十字线 - 横 */}
+                <div className="absolute top-1/2 left-0 right-0 -translate-y-1/2">
+                  <div className="h-[1px] bg-white/30 mx-[15%]"></div>
+                </div>
+                {/* 十字线 - 竖 */}
+                <div className="absolute left-1/2 top-0 bottom-0 -translate-x-1/2">
+                  <div className="w-[1px] bg-white/30 my-[15%]"></div>
+                </div>
+                {/* 刻度标记 - 上下左右小标记 */}
+                <div className="absolute top-0 left-1/2 -translate-x-1/2 -translate-y-1 w-0.5 h-3 bg-white/50"></div>
+                <div className="absolute bottom-0 left-1/2 -translate-x-1/2 translate-y-1 w-0.5 h-3 bg-white/50"></div>
+                <div className="absolute left-0 top-1/2 -translate-y-1/2 -translate-x-1 w-3 h-0.5 bg-white/50"></div>
+                <div className="absolute right-0 top-1/2 -translate-y-1/2 translate-x-1 w-3 h-0.5 bg-white/50"></div>
+              </div>
+            </div>
+            {/* 水平仪 - 底部居中 */}
+            <div className="absolute bottom-4 left-1/2 -translate-x-1/2 pointer-events-none flex flex-col items-center gap-1">
+              <span className="text-[10px] text-white/60 font-medium">水平仪</span>
+              <div className="relative w-48 h-5">
+                {/* 导轨背景 */}
+                <div className="absolute inset-0 bg-white/10 rounded-full"></div>
+                {/* 中心标线 */}
+                <div className="absolute top-0 bottom-0 left-1/2 -translate-x-1/2 w-[1px] bg-white/40"></div>
+                {/* 游标（气泡） */}
+                <div
+                  className="absolute top-1/2 -translate-y-1/2 w-3.5 h-3.5 rounded-full transition-all duration-150"
+                  style={{
+                    left: `${levelDotLeft}%`,
+                    marginLeft: '-7px',
+                    backgroundColor: Math.abs(tiltAngle) < 3 ? '#4ade80' : Math.abs(tiltAngle) < 8 ? '#facc15' : '#f87171',
+                    boxShadow: '0 0 6px rgba(0,0,0,0.5)'
+                  }}
+                ></div>
+              </div>
+              <span className="text-[9px] text-white/40">
+                {Math.abs(tiltAngle) < 2 ? '✓ 水平' : `${tiltAngle > 0 ? '↘' : '↘'} ${Math.abs(tiltAngle).toFixed(1)}°`}
+              </span>
+            </div>
+          </div>
+        )}
+
+        {/* 结果画布（有图片时显示） */}
         <canvas
           ref={canvasRef}
           className="max-w-full max-h-full w-auto h-auto object-contain"
-          style={{ display: imageSrc ? 'block' : 'none', maxWidth: '100%', maxHeight: '100%' }}
+          style={{ display: imageSrc && !cameraActive ? 'block' : 'none', maxWidth: '100%', maxHeight: '100%' }}
         />
-        
-        {!imageSrc && (
+
+        {/* 初始占位 */}
+        {!imageSrc && !cameraActive && (
           <div className="text-gray-500 text-center px-6 absolute pointer-events-none">
             <div className="text-4xl mb-3">🕶️</div>
             <p className="text-sm font-medium text-gray-400">请保持手机平行</p>
             <p className="text-xs text-gray-600 mt-1">将智能眼镜水平置于视野中心拍照</p>
           </div>
         )}
-        
-        {/* 人因交互指引靶心 */}
-        {!imageSrc && (
+
+        {/* 初始靶心 */}
+        {!imageSrc && !cameraActive && (
           <div className="absolute inset-8 border border-dashed border-gray-700 rounded-2xl pointer-events-none flex items-center justify-center">
             <div className="w-full h-[1px] bg-gray-800"></div>
             <div className="h-full w-[1px] bg-gray-800"></div>
@@ -200,23 +363,55 @@ export default function App() {
         )}
 
         <div className="grid grid-cols-2 gap-3">
-          <input type="file" accept="image/*" capture="environment" ref={fileInputRef} onChange={handleFileChange} className="hidden" />
-          
-          <button onClick={() => fileInputRef.current?.click()} disabled={loading} className="py-4 bg-gray-900 disabled:bg-gray-100 disabled:text-gray-400 text-white font-semibold rounded-2xl active:scale-95 disabled:active:scale-100 transition-all flex flex-col items-center justify-center shadow-sm">
-            <span className="text-xl">📸</span>
-            <span className="text-xs mt-1">拍摄眼镜</span>
-          </button>
-          
-          {/* 【需求4】替换"精密分析"按钮为"重新拍摄" */}
-          <button onClick={handleRetake} disabled={!imageSrc || loading} className="py-4 bg-blue-600 disabled:bg-gray-100 disabled:text-gray-400 text-white font-semibold rounded-2xl active:scale-95 disabled:active:scale-100 transition-all flex flex-col items-center justify-center shadow-sm">
-            <span className="text-xl">🔄</span>
-            <span className="text-xs mt-1">重新拍摄</span>
-          </button>
+          {/* 隐藏的文件输入（相册选择，作为相机降级方案） */}
+          <input type="file" accept="image/*" ref={fileInputRef} onChange={handleFileChange} className="hidden" />
+
+          {/* 主按钮：相机模式下为拍照，否则为开启相机 */}
+          {cameraActive ? (
+            <button onClick={capturePhoto} disabled={loading}
+              className="py-4 bg-green-600 disabled:bg-gray-100 disabled:text-gray-400 text-white font-semibold rounded-2xl active:scale-95 disabled:active:scale-100 transition-all flex flex-col items-center justify-center shadow-sm col-span-2">
+              <span className="text-2xl">📷</span>
+              <span className="text-xs mt-1">拍照</span>
+            </button>
+          ) : (
+            <>
+              <button onClick={startCamera} disabled={loading || !!imageSrc}
+                className="py-4 bg-gray-900 disabled:bg-gray-100 disabled:text-gray-400 text-white font-semibold rounded-2xl active:scale-95 disabled:active:scale-100 transition-all flex flex-col items-center justify-center shadow-sm">
+                <span className="text-xl">📸</span>
+                <span className="text-xs mt-1">拍摄眼镜</span>
+              </button>
+
+              <button onClick={() => fileInputRef.current?.click()} disabled={loading || !!imageSrc}
+                className="py-4 bg-gray-600 disabled:bg-gray-100 disabled:text-gray-400 text-white font-semibold rounded-2xl active:scale-95 disabled:active:scale-100 transition-all flex flex-col items-center justify-center shadow-sm">
+                <span className="text-xl">🖼️</span>
+                <span className="text-xs mt-1">选择相册</span>
+              </button>
+            </>
+          )}
         </div>
+
+        {/* 已拍摄照片后的按钮组 */}
+        {imageSrc && !cameraActive && (
+          <div className="grid grid-cols-2 gap-3">
+            <button onClick={handleRetake} disabled={loading}
+              className="py-4 bg-blue-600 disabled:bg-gray-100 disabled:text-gray-400 text-white font-semibold rounded-2xl active:scale-95 disabled:active:scale-100 transition-all flex flex-col items-center justify-center shadow-sm">
+              <span className="text-xl">🔄</span>
+              <span className="text-xs mt-1">重新拍摄</span>
+            </button>
+
+            {/* 从相册选择 */}
+            <button onClick={() => fileInputRef.current?.click()} disabled={loading}
+              className="py-4 bg-gray-600 disabled:bg-gray-100 disabled:text-gray-400 text-white font-semibold rounded-2xl active:scale-95 disabled:active:scale-100 transition-all flex flex-col items-center justify-center shadow-sm">
+              <span className="text-xl">🖼️</span>
+              <span className="text-xs mt-1">选择相册</span>
+            </button>
+          </div>
+        )}
 
         {/* 保存到相册按钮：仅测量成功时显示 */}
         {angleResult !== null && (
-          <button onClick={handleSave} className="w-full py-3 bg-green-600 text-white font-semibold rounded-2xl active:scale-95 transition-all flex items-center justify-center gap-2 shadow-sm">
+          <button onClick={handleSave}
+            className="w-full py-3 bg-green-600 text-white font-semibold rounded-2xl active:scale-95 transition-all flex items-center justify-center gap-2 shadow-sm">
             <span className="text-lg">💾</span>
             <span className="text-sm">保存到相册{userId ? `（${userId}.jpg）` : ''}</span>
           </button>
