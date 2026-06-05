@@ -1,5 +1,5 @@
 // App.tsx
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 
 export default function App() {
@@ -7,6 +7,7 @@ export default function App() {
   const [angleResult, setAngleResult] = useState<number | null>(null);
   const [status, setStatus] = useState<string>('等待载入眼镜图像');
   const [loading, setLoading] = useState<boolean>(false);
+  const [userId, setUserId] = useState<string>('');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -41,11 +42,13 @@ export default function App() {
         // 缩减传输基底体积
         const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.85);
         setImageSrc(compressedDataUrl);
-        setLoading(false);
-        setStatus('图片加载完成，可进行精密分析');
+        setStatus('图像优化完成，正在进行骨架级联解算...');
 
         // 在主画布上初始化原图预览
         drawBaseImageToCanvas(compressedDataUrl);
+        
+        // 【需求4】拍照/选图后自动运行分析
+        runAnalysis(compressedDataUrl, userId);
       };
       img.src = event.target?.result as string;
     };
@@ -67,14 +70,13 @@ export default function App() {
   };
 
   // 运行骨架级联解算
-  const triggerAlgorithm = () => {
-    if (!imageSrc) return;
+  const runAnalysis = (src: string, uid: string) => {
     setLoading(true);
     setStatus('级联核心策略运行中...');
     
     // 初始化 Web Worker
     const worker = new Worker(new URL('./cv.worker.ts', import.meta.url));
-    worker.postMessage({ imageSrc });
+    worker.postMessage({ imageSrc: src, userId: uid });
     
     // 监听 Worker 零拷贝传回的像素数据
     worker.onmessage = (e) => {
@@ -85,7 +87,7 @@ export default function App() {
         setStatus(`测量成功！系统判别：${version}`);
         setAngleResult(angle);
         
-        // 【已修复】利用 Canvas 动态更新带骨架标记的结果图，省去 Base64 编解码耗时
+        // 利用 Canvas 动态更新带骨架标记的结果图
         const canvas = canvasRef.current;
         if (canvas) {
           canvas.width = width;
@@ -98,7 +100,6 @@ export default function App() {
           }
         }
       } else {
-        // 【核心要求】若 V27/V28 级联皆失败，重置状态并警告提示重新拍照
         setStatus('分析未通过');
         setAngleResult(null);
         alert(`⚠️ 测量失败\n\n原因：${msg}`);
@@ -114,17 +115,63 @@ export default function App() {
     };
   };
 
+  // 用户点击"重新拍照"清空状态
+  const handleRetake = () => {
+    setImageSrc(null);
+    setAngleResult(null);
+    setStatus('等待载入眼镜图像');
+    const canvas = canvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext('2d');
+      if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+  };
+
+  // 保存测量结果图片到相册
+  const handleSave = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    // 用 toBlob 获取高质量 JPEG
+    canvas.toBlob((blob) => {
+      if (!blob) return;
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      // 文件名：有编号用编号，否则用时间戳
+      const timestamp = new Date().toISOString().slice(0, 19).replace(/[:-]/g, '');
+      const fileName = userId ? `${userId}.jpg` : `face_angle_${timestamp}.jpg`;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(link.href);
+    }, 'image/jpeg', 0.95);
+  };
+
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col justify-between p-4 font-sans select-none">
       {/* 状态看板 */}
       <div className="bg-white p-4 rounded-2xl shadow-sm text-center">
-        <h1 className="text-xl font-bold text-gray-800 tracking-wide">面弯角精密测量系统</h1>
-        <p className={`text-xs mt-1 font-medium ${loading ? 'text-blue-500 animate-pulse' : 'text-gray-400'}`}>{status}</p>
+        <div className="flex items-center justify-between gap-2 mb-2">
+          <h1 className="text-xl font-bold text-gray-800 tracking-wide">面弯角精密测量系统</h1>
+          {/* 【需求3】用户编号输入 */}
+          <input
+            type="text"
+            placeholder="用户编号"
+            value={userId}
+            onChange={(e) => setUserId(e.target.value)}
+            className="w-28 text-center text-sm border border-gray-300 rounded-lg py-1.5 px-2 focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-transparent"
+          />
+        </div>
+        <p className={`text-xs font-medium ${loading ? 'text-blue-500 animate-pulse' : 'text-gray-400'}`}>{status}</p>
       </div>
 
-      {/* 核心图形渲染区 */}
+      {/* 【需求2】核心图形渲染区 - 自适应缩放 */}
       <div className="relative flex-1 my-4 bg-gray-900 rounded-3xl overflow-hidden flex items-center justify-center shadow-inner min-h-[300px]">
-        <canvas ref={canvasRef} className={`max-w-full max-h-full object-contain ${!imageSrc ? 'hidden' : 'block'}`} />
+        <canvas
+          ref={canvasRef}
+          className="max-w-full max-h-full w-auto h-auto object-contain"
+          style={{ display: imageSrc ? 'block' : 'none', maxWidth: '100%', maxHeight: '100%' }}
+        />
         
         {!imageSrc && (
           <div className="text-gray-500 text-center px-6 absolute pointer-events-none">
@@ -155,16 +202,25 @@ export default function App() {
         <div className="grid grid-cols-2 gap-3">
           <input type="file" accept="image/*" capture="environment" ref={fileInputRef} onChange={handleFileChange} className="hidden" />
           
-          <button onClick={() => fileInputRef.current?.click()} className="py-4 bg-gray-900 text-white font-semibold rounded-2xl active:scale-95 transition-all flex flex-col items-center justify-center shadow-sm">
+          <button onClick={() => fileInputRef.current?.click()} disabled={loading} className="py-4 bg-gray-900 disabled:bg-gray-100 disabled:text-gray-400 text-white font-semibold rounded-2xl active:scale-95 disabled:active:scale-100 transition-all flex flex-col items-center justify-center shadow-sm">
             <span className="text-xl">📸</span>
             <span className="text-xs mt-1">拍摄眼镜</span>
           </button>
           
-          <button onClick={triggerAlgorithm} disabled={!imageSrc || loading} className="py-4 bg-blue-600 disabled:bg-gray-100 disabled:text-gray-400 text-white font-semibold rounded-2xl active:scale-95 disabled:active:scale-100 transition-all flex flex-col items-center justify-center shadow-sm">
-            <span className="text-xl">📐</span>
-            <span className="text-xs mt-1">精密分析</span>
+          {/* 【需求4】替换"精密分析"按钮为"重新拍摄" */}
+          <button onClick={handleRetake} disabled={!imageSrc || loading} className="py-4 bg-blue-600 disabled:bg-gray-100 disabled:text-gray-400 text-white font-semibold rounded-2xl active:scale-95 disabled:active:scale-100 transition-all flex flex-col items-center justify-center shadow-sm">
+            <span className="text-xl">🔄</span>
+            <span className="text-xs mt-1">重新拍摄</span>
           </button>
         </div>
+
+        {/* 保存到相册按钮：仅测量成功时显示 */}
+        {angleResult !== null && (
+          <button onClick={handleSave} className="w-full py-3 bg-green-600 text-white font-semibold rounded-2xl active:scale-95 transition-all flex items-center justify-center gap-2 shadow-sm">
+            <span className="text-lg">💾</span>
+            <span className="text-sm">保存到相册{userId ? `（${userId}.jpg）` : ''}</span>
+          </button>
+        )}
       </div>
     </div>
   );
