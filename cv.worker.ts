@@ -11,7 +11,6 @@ self.onmessage = async (e: MessageEvent) => {
   try {
     // 1. 等待 OpenCV 初始化完成
     if (typeof cv === 'undefined' || !cv.Mat) {
-      // OpenCV.js 可能还在初始化，等待其就绪
       await new Promise<void>((resolve) => {
         const checkReady = () => {
           if (typeof cv !== 'undefined' && cv.Mat) {
@@ -34,39 +33,27 @@ self.onmessage = async (e: MessageEvent) => {
     const dynRadius = Math.max(5, Math.floor(w / 150));      
     const dynLine = Math.max(2, Math.floor(w / 500));        
     
-    // 4. 执行核心的 V27 / V28 级联策略（限定面弯角物理合理阈值为 168.0°）
-    const MIN_ANGLE = 168.0; 
-    const result = runCascadeV27V28(src, w, h, MIN_ANGLE);
+    // 4. 执行级联策略：先 V27（严格），失败则 V28（容错）
+    const MIN_ANGLE = 168.0;
     
-    // 5. 根据级联结果进行响应
-    if (result.success && result.bestSet) {
-      // 识别成功：在原图上绘制拟合骨架线与特征点
-      drawMetrics(src, result.bestSet, dynLine, dynRadius);
-      
-      // 将带有绘制标记的 Mat 转回 ImageData 像素流
-      const dstImgData = matToImageData(src);
-      
-      // 使用可转移对象（Transferable Objects）零拷贝传回主线程，极大提升手机端效率
-      self.postMessage({
-        success: true,
-        angle: result.angle,
-        version: result.version,
-        msg: `成功（算法: ${result.version}）`,
-        rgbaData: dstImgData.data, 
-        width: dstImgData.width,
-        height: dstImgData.height
-      }, [dstImgData.data.buffer as ArrayBuffer]);
+    // 先尝试 V27
+    const resultV27 = runV27(src, w, h, MIN_ANGLE);
+    
+    if (resultV27.success) {
+      drawMetrics(src, resultV27.bestSet, dynLine, dynRadius);
+      sendResult(src, true, resultV27.angle, "V27", `成功（V27）`);
     } else {
-      // V27 和 V28 级联策略均宣告失败
-      self.postMessage({
-        success: false,
-        angle: 0,
-        version: "失败",
-        msg: "未组合出符合眼镜特征的骨架。请确保眼镜水平正对镜头，并重新拍照。"
-      });
+      // V27 失败，尝试 V28
+      const resultV28 = runV28(src, w, h, MIN_ANGLE);
+      
+      if (resultV28.success) {
+        drawMetrics(src, resultV28.bestSet, dynLine, dynRadius);
+        sendResult(src, true, resultV28.angle, "V28", `成功（V28）`);
+      } else {
+        sendResult(src, false, 0, "失败", "未组合出符合眼镜特征的骨架。请确保眼镜水平正对镜头，并重新拍照。");
+      }
     }
     
-    // 6. 严格释放 WebAssembly 内存，防止手机浏览器崩溃
     src.delete();
     
   } catch (error) {
@@ -79,9 +66,23 @@ self.onmessage = async (e: MessageEvent) => {
   }
 };
 
-// ================= 核心级联策略（V27 + V28 融合） =================
-function runCascadeV27V28(src: any, w: number, h: number, minAngle: number) {
-  // 分离 BGR 通道进行差值计算
+function sendResult(src: any, success: boolean, angle: number, version: string, msg: string) {
+  const dstImgData = matToImageData(src);
+  self.postMessage({
+    success,
+    angle,
+    version,
+    msg,
+    rgbaData: dstImgData.data,
+    width: dstImgData.width,
+    height: dstImgData.height
+  }, [dstImgData.data.buffer as ArrayBuffer]);
+}
+
+// ================= V27 算法（严格模式） =================
+// 对应 Python process_image_v27: 3 层 RGB 阈值 + balance_err > 0.15 过滤
+function runV27(src: any, w: number, h: number, minAngle: number) {
+  // 分离 BGR 通道
   let bgrPlanes = new cv.MatVector();
   cv.split(src, bgrPlanes);
   let b = bgrPlanes.get(0);
@@ -93,57 +94,100 @@ function runCascadeV27V28(src: any, w: number, h: number, minAngle: number) {
   cv.subtract(r, g, rgDiff);
   cv.subtract(r, b, rbDiff);
   
-  // 提前准备 HSV 颜色空间，供 V28 的后两层极端容错使用
-  let hsv = new cv.Mat();
-  cv.cvtColor(src, hsv, cv.COLOR_RGBA2RGB); 
-  cv.cvtColor(hsv, hsv, cv.COLOR_RGB2HSV);
-
-  // 5 层级联阈值结构（前3层属V27级联，后2层属V28容错）
   const cascadeThresholds = [
-    // --- V27 级联层 ---
-    { mode: "rgb", rg: 75, rb: 45, r: 120, circ: 0.55, areaMin: 12, version: "V27 (Pass 1)" },
-    { mode: "rgb", rg: 55, rb: 40, r: 100, circ: 0.45, areaMin: 10, version: "V27 (Pass 2)" },
-    { mode: "rgb", rg: 40, rb: 30, r: 80,  circ: 0.35, areaMin: 8,  version: "V27 (Pass 3)" },
-    // --- V28 增强容错层 ---
-    { mode: "hsv", hLow: 0,   hHigh: 10,  sLow: 30, vLow: 60, circ: 0.20, areaMin: 3, version: "V28 (HSV-1)" },
-    { mode: "hsv", hLow: 165, hHigh: 180, sLow: 30, vLow: 60, circ: 0.20, areaMin: 3, version: "V28 (HSV-2)" }
+    { rg: 75, rb: 45, r: 120, circ: 0.55, areaMin: 12 },
+    { rg: 55, rb: 40, r: 100, circ: 0.45, areaMin: 10 },
+    { rg: 40, rb: 30, r: 80,  circ: 0.35, areaMin: 8  }
   ];
   
+  const result = runCascadePasses(src, w, h, minAngle, cascadeThresholds, "rgb", {
+    areaMax: 2000,
+    morphSize: 5,
+    errorThreshold: 0.03,
+    balanceErrFilter: 0.15,   // V27 有平衡误差过滤
+    topN: 12
+  });
+  
+  b.delete(); g.delete(); r.delete(); bgrPlanes.delete();
+  rgDiff.delete(); rbDiff.delete();
+  
+  return result;
+}
+
+// ================= V28 算法（容错模式） =================
+// 对应 Python process_image_v28: 3 层 RGB + 2 层 HSV，无 balance_err 过滤
+function runV28(src: any, w: number, h: number, minAngle: number) {
+  // 分离 BGR 通道
+  let bgrPlanes = new cv.MatVector();
+  cv.split(src, bgrPlanes);
+  let b = bgrPlanes.get(0);
+  let g = bgrPlanes.get(1);
+  let r = bgrPlanes.get(2);
+  
+  let rgDiff = new cv.Mat();
+  let rbDiff = new cv.Mat();
+  cv.subtract(r, g, rgDiff);
+  cv.subtract(r, b, rbDiff);
+  
+  // HSV 颜色空间（V28 后两层使用）
+  let hsv = new cv.Mat();
+  cv.cvtColor(src, hsv, cv.COLOR_RGBA2RGB);
+  cv.cvtColor(hsv, hsv, cv.COLOR_RGB2HSV);
+  
+  const cascadeThresholds = [
+    // 3 层 RGB（阈值比 V27 宽松）
+    { mode: "rgb", rg: 75, rb: 45, r: 120, circ: 0.55, areaMin: 12 },
+    { mode: "rgb", rg: 55, rb: 40, r: 100, circ: 0.40, areaMin: 8  },
+    { mode: "rgb", rg: 40, rb: 30, r: 80,  circ: 0.25, areaMin: 5  },
+    // 2 层 HSV 容错
+    { mode: "hsv", hLow: 0,   hHigh: 10,  sLow: 30, vLow: 60, circ: 0.20, areaMin: 3 },
+    { mode: "hsv", hLow: 165, hHigh: 180, sLow: 30, vLow: 60, circ: 0.20, areaMin: 3 }
+  ];
+  
+  const result = runCascadePassesV28(src, w, h, minAngle, cascadeThresholds, rgDiff, rbDiff, r, hsv);
+  
+  b.delete(); g.delete(); r.delete(); bgrPlanes.delete();
+  rgDiff.delete(); rbDiff.delete(); hsv.delete();
+  
+  return result;
+}
+
+// ================= V28 级联执行（不传递 balanceErrFilter，RGB 无平衡误差过滤） =================
+function runCascadePassesV28(
+  src: any, w: number, h: number, minAngle: number,
+  thresholds: any[], rgDiff: any, rbDiff: any, r: any, hsv: any
+) {
   let bestSet: any = null;
   let minGeometricError = Infinity;
   let finalAngle = 0;
-  let matchedVersion = "无";
 
-  // 逐层遍历级联阈值
-  for (let th of cascadeThresholds) {
+  for (let th of thresholds) {
     let mask = new cv.Mat();
     
     if (th.mode === "rgb") {
       let mask1 = new cv.Mat();
       let mask2 = new cv.Mat();
       let mask3 = new cv.Mat();
-      cv.threshold(rgDiff, mask1, th.rg!, 255, cv.THRESH_BINARY);
-      cv.threshold(rbDiff, mask2, th.rb!, 255, cv.THRESH_BINARY);
-      cv.threshold(r, mask3, th.r!, 255, cv.THRESH_BINARY);
-      
+      cv.threshold(rgDiff, mask1, th.rg, 255, cv.THRESH_BINARY);
+      cv.threshold(rbDiff, mask2, th.rb, 255, cv.THRESH_BINARY);
+      cv.threshold(r, mask3, th.r, 255, cv.THRESH_BINARY);
       cv.bitwise_and(mask1, mask2, mask);
       cv.bitwise_and(mask, mask3, mask);
-      
       mask1.delete(); mask2.delete(); mask3.delete();
     } else {
-      let lowBound = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [th.hLow!, th.sLow!, th.vLow!, 0]);
-      let highBound = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [th.hHigh!, 255, 255, 255]);
+      let lowBound = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [th.hLow, th.sLow, th.vLow, 0]);
+      let highBound = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [th.hHigh, 255, 255, 255]);
       cv.inRange(hsv, lowBound, highBound, mask);
       lowBound.delete(); highBound.delete();
     }
     
-    // 形态学处理（闭运算连接断开的红色特征点区域）
+    // 形态学处理
     let ksize = th.mode === "rgb" ? new cv.Size(5, 5) : new cv.Size(7, 7);
     let kernelClose = cv.getStructuringElement(cv.MORPH_ELLIPSE, ksize);
     cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernelClose);
     kernelClose.delete();
     
-    // V28 追加一次小核膨胀提升边缘鲁棒性
+    // HSV 层追加膨胀
     if (th.mode === "hsv") {
       let kernelDilate = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3, 3));
       cv.dilate(mask, mask, kernelDilate, new cv.Point(-1, -1), 1);
@@ -172,8 +216,6 @@ function runCascadeV27V28(src: any, w: number, h: number, minAngle: number) {
           if (M.m00 !== 0) {
             let cX = Math.floor(M.m10 / M.m00);
             let cY = Math.floor(M.m01 / M.m00);
-            
-            // 剔除贴近手机屏幕物理边缘的噪点（2% 边缘安全区）
             if (0.02 * w < cX && cX < 0.98 * w && 0.02 * h < cY && cY < 0.98 * h) {
               candidates.push({ cX, cY, area });
             }
@@ -182,13 +224,11 @@ function runCascadeV27V28(src: any, w: number, h: number, minAngle: number) {
       }
     }
     
-    // 按面积从大到小排序
     candidates.sort((a, b) => b.area - a.area);
     let pts = th.mode === "rgb" ? candidates.slice(0, 12) : candidates.slice(0, 15);
     
-    // 三点空间几何校验与骨架拟合
     if (pts.length >= 3) {
-      const errorThreshold = th.mode === "rgb" ? 0.03 : 0.02; 
+      const errorThreshold = th.mode === "rgb" ? 0.03 : 0.02;
       
       for (let i = 0; i < pts.length - 2; i++) {
         if (minGeometricError < errorThreshold) break;
@@ -204,16 +244,13 @@ function runCascadeV27V28(src: any, w: number, h: number, minAngle: number) {
             let dists = [dAB, dBC, dCA];
             let maxDist = Math.max(...dists);
             
-            // 约束智能眼镜物理镜片跨度的最小特征比例
             if (maxDist < Math.min(w, h) * 0.30) continue;
             
-            // 定位中点 (p_mid) 与外侧翼点 (p1, p2)
             let p_mid, p1, p2;
             if (maxDist === dAB) { p_mid = pC; p1 = pA; p2 = pB; }
             else if (maxDist === dBC) { p_mid = pA; p1 = pB; p2 = pC; }
             else { p_mid = pB; p1 = pA; p2 = pC; }
             
-            // 解算三点向量夹角
             let v1 = { x: p1.cX - p_mid.cX, y: p1.cY - p_mid.cY };
             let v2 = { x: p2.cX - p_mid.cX, y: p2.cY - p_mid.cY };
             
@@ -223,18 +260,143 @@ function runCascadeV27V28(src: any, w: number, h: number, minAngle: number) {
             let cosTheta = dot / (len1 * len2);
             let angle = (Math.acos(Math.min(Math.max(cosTheta, -1.0), 1.0)) * 180) / Math.PI;
             
-            // 限定合理夹角区间
             if (angle < 160 || angle > 180) continue;
             
-            // 对称性校验
             let balanceErr = Math.abs(len1 - len2) / Math.max(len1, len2, 1);
-            if (th.mode === "rgb" && balanceErr > 0.15) continue; 
+            
+            // 【关键】V28 的 RGB 层没有 balanceErr > 0.15 过滤
+            // 与 Python V28 完全一致：直接用 balanceErr 和 minGeometricError 比较
+            if (balanceErr < minGeometricError && angle >= minAngle) {
+              minGeometricError = balanceErr;
+              bestSet = [p1, p_mid, p2];
+              finalAngle = angle;
+            }
+          }
+        }
+      }
+    }
+    
+    mask.delete(); contours.delete(); hierarchy.delete();
+    if (bestSet) break;
+  }
+  
+  return { success: bestSet !== null, bestSet, angle: finalAngle };
+}
+
+// ================= 通用级联执行（用于 V27） =================
+function runCascadePasses(
+  src: any, w: number, h: number, minAngle: number,
+  thresholds: any[], mode: string,
+  opts: { areaMax: number, morphSize: number, errorThreshold: number, balanceErrFilter?: number, topN: number }
+) {
+  // 重新获取通道和差值（因为 V27 和 V28 独立运行，src 是原始图像）
+  let bgrPlanes = new cv.MatVector();
+  cv.split(src, bgrPlanes);
+  let b = bgrPlanes.get(0);
+  let g = bgrPlanes.get(1);
+  let r = bgrPlanes.get(2);
+  
+  let rgDiff = new cv.Mat();
+  let rbDiff = new cv.Mat();
+  cv.subtract(r, g, rgDiff);
+  cv.subtract(r, b, rbDiff);
+
+  let bestSet: any = null;
+  let minGeometricError = Infinity;
+  let finalAngle = 0;
+
+  for (let th of thresholds) {
+    let mask = new cv.Mat();
+    
+    let mask1 = new cv.Mat();
+    let mask2 = new cv.Mat();
+    let mask3 = new cv.Mat();
+    cv.threshold(rgDiff, mask1, th.rg, 255, cv.THRESH_BINARY);
+    cv.threshold(rbDiff, mask2, th.rb, 255, cv.THRESH_BINARY);
+    cv.threshold(r, mask3, th.r, 255, cv.THRESH_BINARY);
+    cv.bitwise_and(mask1, mask2, mask);
+    cv.bitwise_and(mask, mask3, mask);
+    mask1.delete(); mask2.delete(); mask3.delete();
+    
+    // 形态学处理
+    let kernelClose = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(opts.morphSize, opts.morphSize));
+    cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernelClose);
+    kernelClose.delete();
+    
+    // 提取轮廓
+    let contours = new cv.MatVector();
+    let hierarchy = new cv.Mat();
+    cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    
+    let candidates: Array<{ cX: number, cY: number, area: number }> = [];
+    
+    for (let i = 0; i < contours.size(); ++i) {
+      let cnt = contours.get(i);
+      let area = cv.contourArea(cnt);
+      
+      if (area > th.areaMin && area < opts.areaMax) {
+        let perimeter = cv.arcLength(cnt, true);
+        if (perimeter === 0) continue;
+        let circularity = (4 * Math.PI * area) / (perimeter * perimeter);
+        
+        if (circularity >= th.circ) {
+          let M = cv.moments(cnt);
+          if (M.m00 !== 0) {
+            let cX = Math.floor(M.m10 / M.m00);
+            let cY = Math.floor(M.m01 / M.m00);
+            if (0.02 * w < cX && cX < 0.98 * w && 0.02 * h < cY && cY < 0.98 * h) {
+              candidates.push({ cX, cY, area });
+            }
+          }
+        }
+      }
+    }
+    
+    candidates.sort((a, b) => b.area - a.area);
+    let pts = candidates.slice(0, opts.topN);
+    
+    if (pts.length >= 3) {
+      for (let i = 0; i < pts.length - 2; i++) {
+        if (minGeometricError < opts.errorThreshold) break;
+        for (let j = i + 1; j < pts.length - 1; j++) {
+          if (minGeometricError < opts.errorThreshold) break;
+          for (let k = j + 1; k < pts.length; k++) {
+            let pA = pts[i], pB = pts[j], pC = pts[k];
+            
+            let dAB = Math.hypot(pA.cX - pB.cX, pA.cY - pB.cY);
+            let dBC = Math.hypot(pB.cX - pC.cX, pB.cY - pC.cY);
+            let dCA = Math.hypot(pC.cX - pA.cX, pC.cY - pA.cY);
+            
+            let dists = [dAB, dBC, dCA];
+            let maxDist = Math.max(...dists);
+            
+            if (maxDist < Math.min(w, h) * 0.30) continue;
+            
+            let p_mid, p1, p2;
+            if (maxDist === dAB) { p_mid = pC; p1 = pA; p2 = pB; }
+            else if (maxDist === dBC) { p_mid = pA; p1 = pB; p2 = pC; }
+            else { p_mid = pB; p1 = pA; p2 = pC; }
+            
+            let v1 = { x: p1.cX - p_mid.cX, y: p1.cY - p_mid.cY };
+            let v2 = { x: p2.cX - p_mid.cX, y: p2.cY - p_mid.cY };
+            
+            let dot = v1.x * v2.x + v1.y * v2.y;
+            let len1 = Math.hypot(v1.x, v1.y);
+            let len2 = Math.hypot(v2.x, v2.y);
+            let cosTheta = dot / (len1 * len2);
+            let angle = (Math.acos(Math.min(Math.max(cosTheta, -1.0), 1.0)) * 180) / Math.PI;
+            
+            if (angle < 160 || angle > 180) continue;
+            
+            let balanceErr = Math.abs(len1 - len2) / Math.max(len1, len2, 1);
+            
+            // V27 的 balanceErr 过滤
+            if (opts.balanceErrFilter !== undefined && balanceErr > opts.balanceErrFilter) continue;
             
             if (balanceErr < minGeometricError && angle >= minAngle) {
               minGeometricError = balanceErr;
               bestSet = [p1, p_mid, p2];
               finalAngle = angle;
-              matchedVersion = th.version.includes("V27") ? "V27" : "V28";
             }
           }
         }
@@ -246,9 +408,9 @@ function runCascadeV27V28(src: any, w: number, h: number, minAngle: number) {
   }
   
   b.delete(); g.delete(); r.delete(); bgrPlanes.delete();
-  rgDiff.delete(); rbDiff.delete(); hsv.delete();
-
-  return { success: bestSet !== null, bestSet, angle: finalAngle, version: matchedVersion };
+  rgDiff.delete(); rbDiff.delete();
+  
+  return { success: bestSet !== null, bestSet, angle: finalAngle };
 }
 
 // ================= 辅助可视化绘制 =================
