@@ -6,7 +6,7 @@ declare var cv: any;
 
 // 监听主线程发送的图片数据
 self.onmessage = async (e: MessageEvent) => {
-  const { imageSrc } = e.data;
+  const { imageSrc, userId } = e.data;
   
   try {
     // 1. 等待 OpenCV 初始化完成
@@ -46,14 +46,14 @@ self.onmessage = async (e: MessageEvent) => {
     const resultV27 = runV27(src, w, h, MIN_ANGLE);
     
     if (resultV27.success) {
-      drawMetrics(src, resultV27.bestSet, dynLine, dynRadius);
+      drawMetrics(src, resultV27.bestSet, resultV27.angle, dynLine, dynRadius, userId);
       sendResult(src, true, resultV27.angle, "V27", `成功（V27）`);
     } else {
       // V27 失败，尝试 V28
       const resultV28 = runV28(src, w, h, MIN_ANGLE);
       
       if (resultV28.success) {
-        drawMetrics(src, resultV28.bestSet, dynLine, dynRadius);
+        drawMetrics(src, resultV28.bestSet, resultV28.angle, dynLine, dynRadius, userId);
         sendResult(src, true, resultV28.angle, "V28", `成功（V28）`);
       } else {
         sendResult(src, false, 0, "失败", "未组合出符合眼镜特征的骨架。请确保眼镜水平正对镜头，并重新拍照。");
@@ -419,7 +419,8 @@ function runCascadePasses(
 }
 
 // ================= 辅助可视化绘制 =================
-function drawMetrics(src: any, bestSet: any[], dynLine: number, dynRadius: number) {
+function drawMetrics(src: any, bestSet: any[], angle: number, dynLine: number, dynRadius: number, userId?: string) {
+  // 骨架线绘制
   let p1 = new cv.Point(bestSet[0].cX, bestSet[0].cY);
   let p_mid = new cv.Point(bestSet[1].cX, bestSet[1].cY);
   let p2 = new cv.Point(bestSet[2].cX, bestSet[2].cY);
@@ -431,6 +432,40 @@ function drawMetrics(src: any, bestSet: any[], dynLine: number, dynRadius: numbe
     cv.circle(src, p, dynRadius, [0, 255, 255, 255], -1, cv.LINE_AA);
     cv.circle(src, p, dynRadius, [0, 0, 0, 255], 1, cv.LINE_AA);
   }
+  
+  // 动态计算字体大小和厚度（基于图像宽度，确保 CSS 缩放后仍可读）
+  const h = src.rows;
+  const w = src.cols;
+  const fontSize = Math.max(1.0, w / 550);     // 1200px 图 → ~2.2
+  const fontThick = Math.max(2, Math.floor(w / 400));  // 1200px 图 → 3
+  
+  // 【需求】在中间点 p_mid 附近绘制角度值（仅数字，无符号）
+  // 相对于 p_mid 的偏移量（向右上方偏移）
+  const offsetX = Math.floor(w * 0.03);
+  const offsetY = -Math.floor(h * 0.04);
+  // 确保不超出图像边界
+  let textX = p_mid.x + offsetX;
+  let textY = p_mid.y + offsetY;
+  textX = Math.max(Math.floor(w * 0.02), Math.min(textX, Math.floor(w * 0.7)));
+  textY = Math.max(Math.floor(h * 0.12), Math.min(textY, Math.floor(h * 0.88)));
+  
+  const lineHeight = Math.floor(fontSize * 28);  // 行高（像素）
+  
+  // 如果存在用户编号，在角度上方绘制（白色）
+  if (userId) {
+    const idText = `ID: ${userId}`;
+    // 黑色描边
+    cv.putText(src, idText, new cv.Point(textX, textY - lineHeight), cv.FONT_HERSHEY_SIMPLEX, fontSize, [0, 0, 0, 255], fontThick + 3, cv.LINE_AA);
+    // 白色文字
+    cv.putText(src, idText, new cv.Point(textX, textY - lineHeight), cv.FONT_HERSHEY_SIMPLEX, fontSize, [255, 255, 255, 255], fontThick, cv.LINE_AA);
+  }
+  
+  // 角度值（黄色）
+  const angleText = `${angle.toFixed(2)}`;
+  // 黑色描边
+  cv.putText(src, angleText, new cv.Point(textX, textY), cv.FONT_HERSHEY_SIMPLEX, fontSize, [0, 0, 0, 255], fontThick + 3, cv.LINE_AA);
+  // 黄色主文字（醒目）
+  cv.putText(src, angleText, new cv.Point(textX, textY), cv.FONT_HERSHEY_SIMPLEX, fontSize, [0, 255, 255, 255], fontThick, cv.LINE_AA);
 }
 
 // ================= 数据类型互转工具函数 =================
