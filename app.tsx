@@ -1,8 +1,23 @@
-// App.tsx
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 
+// ============================================================
+//  角度计算（手动模式）
+// ============================================================
+function calcAngle(pL: {x:number,y:number}, pM: {x:number,y:number}, pR: {x:number,y:number}) {
+  const v1 = { x: pL.x - pM.x, y: pL.y - pM.y };
+  const v2 = { x: pR.x - pM.x, y: pR.y - pM.y };
+  const dot = v1.x * v2.x + v1.y * v2.y;
+  const mag1 = Math.sqrt(v1.x * v1.x + v1.y * v1.y);
+  const mag2 = Math.sqrt(v2.x * v2.x + v2.y * v2.y);
+  const cos = Math.max(-1, Math.min(1, dot / (mag1 * mag2)));
+  return Math.acos(cos) * 180 / Math.PI;
+}
+
 export default function App() {
+  // ============================================================
+  //  已有状态（自动模式）
+  // ============================================================
   const [imageSrc, setImageSrc] = useState<string | null>(null);
   const [angleResult, setAngleResult] = useState<number | null>(null);
   const [status, setStatus] = useState<string>('等待载入眼镜图像');
@@ -11,46 +26,74 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // 当用户拍照或上传图片时触发
+  // ============================================================
+  //  手动模式状态
+  // ============================================================
+  const [mode, setMode] = useState<'auto' | 'manual'>('auto');
+  const [manualPoints, setManualPoints] = useState<Array<{x:number,y:number}>>([]);
+  const [manualAngle, setManualAngle] = useState<number | null>(null);
+  const rawImgRef = useRef<HTMLImageElement | null>(null); // 原始图片对象
+  const imgNaturalRef = useRef<{w:number,h:number} | null>(null);
+
+  // 步骤文字
+  const stepLabels = ['① 点击左边框拐角', '② 点击鼻梁正中', '③ 点击右边框拐角'];
+
+  // ============================================================
+  //  图片上传（同时兼容两种模式）
+  // ============================================================
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
     setLoading(true);
-    setStatus('正在进行人因测量分辨率优化...');
+    setStatus('正在载入图像...');
     setAngleResult(null);
+    setManualPoints([]);
+    setManualAngle(null);
 
     const reader = new FileReader();
     reader.onload = (event) => {
       const img = new Image();
       img.onload = () => {
-        const canvas = document.createElement('canvas');
+        // 压缩至 1200px 以内
         const MAX_WIDTH = 1200;
         let width = img.width;
         let height = img.height;
-
         if (width > MAX_WIDTH) {
           height = Math.round((height * MAX_WIDTH) / width);
           width = MAX_WIDTH;
         }
-
+        const canvas = document.createElement('canvas');
         canvas.width = width;
         canvas.height = height;
         const ctx = canvas.getContext('2d');
         ctx?.drawImage(img, 0, 0, width, height);
-        
         const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.85);
+
+        // 存储原始图片信息
+        rawImgRef.current = img;
+        imgNaturalRef.current = { w: img.width, h: img.height };
+
         setImageSrc(compressedDataUrl);
-        setStatus('图像优化完成，正在进行骨架级联解算...');
-        drawBaseImageToCanvas(compressedDataUrl);
-        runAnalysis(compressedDataUrl, userId);
+        setLoading(false);
+
+        if (mode === 'auto') {
+          setStatus('图像优化完成，正在进行骨架级联解算...');
+          drawBaseImageToCanvas(compressedDataUrl);
+          runAnalysis(compressedDataUrl, userId);
+        } else {
+          setStatus('请在图片上点击 3 个点');
+          drawImageToCanvas(compressedDataUrl, width, height);
+        }
       };
       img.src = event.target?.result as string;
     };
     reader.readAsDataURL(file);
   };
 
-  // 辅助函数：初始化画布
+  // ============================================================
+  //  Canvas 绘制：自动模式 - 原始底图
+  // ============================================================
   const drawBaseImageToCanvas = (dataUrl: string) => {
     const img = new Image();
     img.onload = () => {
@@ -64,7 +107,234 @@ export default function App() {
     img.src = dataUrl;
   };
 
-  // 运行骨架级联解算
+  // ============================================================
+  //  Canvas 绘制：手动模式 - 图片 + 标注
+  // ============================================================
+  const drawImageToCanvas = useCallback((dataUrl: string, w: number, h: number) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.drawImage(img, 0, 0, w, h);
+      // 已有点的标注由 drawAnnotations 负责
+      drawAnnotations(ctx, w, h, []);
+    };
+    img.src = dataUrl;
+  }, []);
+
+  // ============================================================
+  //  绘制手动模式的标注
+  // ============================================================
+  const drawAnnotations = (ctx: CanvasRenderingContext2D, cw: number, ch: number, pts: Array<{x:number,y:number}>) => {
+    const imgNat = imgNaturalRef.current;
+    if (!imgNat) return;
+
+    // 计算 canvas 坐标 ↔ 图片坐标 的缩放比
+    const scaleX = imgNat.w / cw;
+    const scaleY = imgNat.h / ch;
+
+    const fs = Math.max(0.7, cw / 900);
+    const dotR = Math.max(7, Math.round(9 * fs));
+    const crossLen = Math.max(9, Math.round(13 * fs));
+    const lw = Math.max(1.5, Math.round(1.5 * fs));
+
+    const colors = ['#00c853', '#ff1744', '#2979ff'];
+
+    // 绘制已点击的点
+    for (let i = 0; i < pts.length; i++) {
+      const cx = pts[i].x / scaleX;
+      const cy = pts[i].y / scaleY;
+      // 空心圈
+      ctx.beginPath();
+      ctx.arc(cx, cy, dotR, 0, Math.PI * 2);
+      ctx.strokeStyle = colors[i];
+      ctx.lineWidth = lw + 0.5;
+      ctx.stroke();
+      // 十字线
+      ctx.beginPath();
+      ctx.moveTo(cx - crossLen, cy);
+      ctx.lineTo(cx + crossLen, cy);
+      ctx.moveTo(cx, cy - crossLen);
+      ctx.lineTo(cx, cy + crossLen);
+      ctx.strokeStyle = colors[i];
+      ctx.lineWidth = lw;
+      ctx.stroke();
+      // 中心小点
+      ctx.beginPath();
+      ctx.arc(cx, cy, 1.5, 0, Math.PI * 2);
+      ctx.fillStyle = colors[i];
+      ctx.fill();
+    }
+
+    // 连线（2个点以上）
+    if (pts.length >= 2) {
+      const p_m = pts[Math.min(1, pts.length - 1)];
+      const others = pts.length === 3 ? [pts[0], pts[2]] : [pts[0]];
+      for (const p of others) {
+        if (p === p_m) continue;
+        ctx.beginPath();
+        ctx.moveTo(p_m.x / scaleX, p_m.y / scaleY);
+        ctx.lineTo(p.x / scaleX, p.y / scaleY);
+        ctx.strokeStyle = '#ff6d00';
+        ctx.lineWidth = lw;
+        ctx.setLineDash([Math.round(7 * fs), Math.round(3 * fs)]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+
+    // 3 个点齐全：角度弧线和文字
+    if (pts.length === 3) {
+      const angle = calcAngle(pts[0], pts[1], pts[2]);
+      setManualAngle(angle);
+
+      const p_m = pts[1];
+      const cx = p_m.x / scaleX, cy = p_m.y / scaleY;
+      const v1 = { x: pts[0].x - p_m.x, y: pts[0].y - p_m.y };
+      const v2 = { x: pts[2].x - p_m.x, y: pts[2].y - p_m.y };
+      const a1 = Math.atan2(v1.y, v1.x);
+      const a2 = Math.atan2(v2.y, v2.x);
+      let startA = a1, endA = a2;
+      let diff = endA - startA;
+      if (diff < 0) diff += Math.PI * 2;
+      if (diff > Math.PI) [startA, endA] = [endA, startA];
+
+      const arcR = Math.min(70, Math.max(35, cw * 0.07));
+      ctx.beginPath();
+      ctx.arc(cx, cy, arcR, startA, endA);
+      ctx.strokeStyle = '#ff1744';
+      ctx.lineWidth = lw + 1;
+      ctx.stroke();
+
+      // 角度文字
+      const midA = (startA + endA) / 2;
+      const textR = arcR + 25 * fs;
+      const tx = cx + Math.cos(midA) * textR;
+      const ty = cy + Math.sin(midA) * textR;
+      ctx.font = `bold ${Math.round(20 * fs)}px -apple-system, sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      const txt = `${angle.toFixed(1)}°`;
+      const tm = ctx.measureText(txt);
+      const pad = 6 * fs;
+      ctx.fillStyle = 'rgba(0,0,0,0.7)';
+      ctx.fillRect(tx - tm.width/2 - pad, ty - 13*fs - pad, tm.width + pad*2, 26*fs + pad*2);
+      ctx.fillStyle = '#ff1744';
+      ctx.fillText(txt, tx, ty);
+    }
+  };
+
+  // ============================================================
+  //  手动模式 Canvas 点击
+  // ============================================================
+  const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (mode !== 'manual') return;
+    if (manualPoints.length >= 3) return;
+
+    const canvas = canvasRef.current;
+    if (!canvas || !imgNaturalRef.current) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = imgNaturalRef.current.w / canvas.width;
+    const scaleY = imgNaturalRef.current.h / canvas.height;
+    const imgX = Math.round((e.clientX - rect.left) * scaleX);
+    const imgY = Math.round((e.clientY - rect.top) * scaleY);
+
+    const newPts = [...manualPoints, { x: imgX, y: imgY }];
+    setManualPoints(newPts);
+
+    // 重绘 canvas
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    // 重新绘制底图
+    const img = rawImgRef.current;
+    if (img) {
+      // 由于 canvas 尺寸可能和底图不同，需要绘制缩放版本
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      // 绘制缩放到 canvas 尺寸的图片
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    }
+    drawAnnotations(ctx, canvas.width, canvas.height, newPts);
+  };
+
+  const resetManualPoints = () => {
+    setManualPoints([]);
+    setManualAngle(null);
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const img = rawImgRef.current;
+    if (img) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    }
+  };
+
+  // ============================================================
+  //  手动模式：保存结果图
+  // ============================================================
+  const handleManualSave = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.toBlob((blob) => {
+      if (!blob) return;
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      const angle = manualAngle?.toFixed(1) ?? 'unknown';
+      link.download = `manual_angle_${angle}deg.png`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(link.href);
+    }, 'image/png');
+  };
+
+  // ============================================================
+  //  模式切换
+  // ============================================================
+  const switchMode = (newMode: 'auto' | 'manual') => {
+    if (newMode === mode) return;
+    setMode(newMode);
+    setManualPoints([]);
+    setManualAngle(null);
+    setAngleResult(null);
+
+    if (newMode === 'manual' && imageSrc && rawImgRef.current) {
+      setStatus('请在图片上点击 3 个点');
+      const canvas = canvasRef.current;
+      if (canvas) {
+        const imgNat = imgNaturalRef.current;
+        if (imgNat) {
+          // 保持 canvas 尺寸与压缩后的图片一致
+          const MAX_WIDTH = 1200;
+          let w = imgNat.w, h = imgNat.h;
+          if (w > MAX_WIDTH) {
+            h = Math.round((h * MAX_WIDTH) / w);
+            w = MAX_WIDTH;
+          }
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.drawImage(rawImgRef.current, 0, 0, w, h);
+          }
+        }
+      }
+    } else if (newMode === 'auto' && imageSrc) {
+      setStatus('图像优化完成，正在进行骨架级联解算...');
+      drawBaseImageToCanvas(imageSrc);
+      runAnalysis(imageSrc, userId);
+    }
+  };
+
+  // ============================================================
+  //  自动分析（原方法保持不变）
+  // ============================================================
   const runAnalysis = (src: string, uid: string) => {
     setLoading(true);
     setStatus('级联核心策略运行中...');
@@ -107,11 +377,17 @@ export default function App() {
     };
   };
 
-  // 用户点击"重新拍照"清空状态
+  // ============================================================
+  //  重新拍摄
+  // ============================================================
   const handleRetake = () => {
     setImageSrc(null);
     setAngleResult(null);
+    setManualPoints([]);
+    setManualAngle(null);
     setStatus('等待载入眼镜图像');
+    rawImgRef.current = null;
+    imgNaturalRef.current = null;
     const canvas = canvasRef.current;
     if (canvas) {
       const ctx = canvas.getContext('2d');
@@ -119,8 +395,10 @@ export default function App() {
     }
   };
 
-  // 保存测量结果图片到相册
-  const handleSave = () => {
+  // ============================================================
+  //  自动模式保存
+  // ============================================================
+  const handleAutoSave = () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     canvas.toBlob((blob) => {
@@ -137,6 +415,9 @@ export default function App() {
     }, 'image/jpeg', 0.95);
   };
 
+  // ============================================================
+  //  渲染
+  // ============================================================
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col justify-between p-4 font-sans select-none">
       {/* 状态看板 */}
@@ -151,15 +432,38 @@ export default function App() {
             className="w-28 text-center text-sm border border-gray-300 rounded-lg py-1.5 px-2 focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-transparent"
           />
         </div>
+
+        {/* 模式切换 */}
+        <div className="flex gap-1 mb-2 bg-gray-100 p-1 rounded-xl">
+          <button
+            onClick={() => switchMode('auto')}
+            className={`flex-1 py-1.5 text-xs font-semibold rounded-lg transition-all ${mode === 'auto' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500'}`}
+          >
+            🤖 自动检测
+          </button>
+          <button
+            onClick={() => switchMode('manual')}
+            className={`flex-1 py-1.5 text-xs font-semibold rounded-lg transition-all ${mode === 'manual' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500'}`}
+          >
+            👆 手动选点
+          </button>
+        </div>
+
         <p className={`text-xs font-medium ${loading ? 'text-blue-500 animate-pulse' : 'text-gray-400'}`}>{status}</p>
       </div>
 
-      {/* 核心图形渲染区 - 自适应缩放 */}
+      {/* 核心图形渲染区 */}
       <div className="relative flex-1 my-4 bg-gray-900 rounded-3xl overflow-hidden flex items-center justify-center shadow-inner min-h-[300px]">
         <canvas
           ref={canvasRef}
           className="max-w-full max-h-full w-auto h-auto object-contain"
-          style={{ display: imageSrc ? 'block' : 'none', maxWidth: '100%', maxHeight: '100%' }}
+          style={{
+            display: imageSrc ? 'block' : 'none',
+            maxWidth: '100%',
+            maxHeight: '100%',
+            cursor: mode === 'manual' && manualPoints.length < 3 ? 'crosshair' : 'default'
+          }}
+          onClick={handleCanvasClick}
         />
         
         {!imageSrc && (
@@ -178,9 +482,38 @@ export default function App() {
         )}
       </div>
 
+      {/* 手动模式步骤指引 */}
+      {mode === 'manual' && imageSrc && (
+        <div className="flex justify-center gap-2 mb-2 text-xs">
+          {stepLabels.map((label, i) => (
+            <span
+              key={i}
+              className={`px-3 py-1 rounded-full font-medium transition-all ${
+                i < manualPoints.length
+                  ? 'bg-green-100 text-green-700 border border-green-300'
+                  : i === manualPoints.length
+                  ? 'bg-blue-100 text-blue-700 border border-blue-300 animate-pulse'
+                  : 'bg-gray-100 text-gray-400 border border-gray-200'
+              }`}
+            >
+              {label}
+            </span>
+          ))}
+        </div>
+      )}
+
       {/* 控制面板 */}
       <div className="bg-white p-5 rounded-3xl shadow-md space-y-4">
-        {angleResult !== null && (
+        {/* 手动模式结果 */}
+        {mode === 'manual' && manualAngle !== null && (
+          <div className="text-center bg-gray-50 py-3 rounded-2xl border border-blue-50/50 animate-fade-in">
+            <span className="text-[10px] text-gray-400 block uppercase tracking-widest font-bold">Face Wrap Angle</span>
+            <span className="text-3xl font-black text-blue-600">{manualAngle.toFixed(2)}°</span>
+          </div>
+        )}
+
+        {/* 自动模式结果 */}
+        {mode === 'auto' && angleResult !== null && (
           <div className="text-center bg-gray-50 py-3 rounded-2xl border border-blue-50/50 animate-fade-in">
             <span className="text-[10px] text-gray-400 block uppercase tracking-widest font-bold">Face Wrap Angle</span>
             <span className="text-3xl font-black text-blue-600">{angleResult.toFixed(2)}°</span>
@@ -201,8 +534,25 @@ export default function App() {
           </button>
         </div>
 
-        {angleResult !== null && (
-          <button onClick={handleSave} className="w-full py-3 bg-green-600 text-white font-semibold rounded-2xl active:scale-95 transition-all flex items-center justify-center gap-2 shadow-sm">
+        {/* 手动模式：重置选点 + 保存 */}
+        {mode === 'manual' && manualPoints.length > 0 && (
+          <div className="grid grid-cols-2 gap-3">
+            <button onClick={resetManualPoints} className="w-full py-3 bg-gray-200 text-gray-700 font-semibold rounded-2xl active:scale-95 transition-all flex items-center justify-center gap-2 shadow-sm">
+              <span className="text-lg">↩️</span>
+              <span className="text-sm">重新选点</span>
+            </button>
+            {manualAngle !== null && (
+              <button onClick={handleManualSave} className="w-full py-3 bg-green-600 text-white font-semibold rounded-2xl active:scale-95 transition-all flex items-center justify-center gap-2 shadow-sm">
+                <span className="text-lg">💾</span>
+                <span className="text-sm">保存结果图</span>
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* 自动模式：保存按钮 */}
+        {mode === 'auto' && angleResult !== null && (
+          <button onClick={handleAutoSave} className="w-full py-3 bg-green-600 text-white font-semibold rounded-2xl active:scale-95 transition-all flex items-center justify-center gap-2 shadow-sm">
             <span className="text-lg">💾</span>
             <span className="text-sm">保存到相册{userId ? `（${userId}.jpg）` : ''}</span>
           </button>
