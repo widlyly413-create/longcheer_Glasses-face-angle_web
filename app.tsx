@@ -32,6 +32,7 @@ export default function App() {
   const [mode, setMode] = useState<'auto' | 'manual'>('auto');
   const [manualPoints, setManualPoints] = useState<Array<{x:number,y:number}>>([]);
   const [manualAngle, setManualAngle] = useState<number | null>(null);
+  const [adjustingIdx, setAdjustingIdx] = useState<number>(-1); // -1=未调整, 0/1/2=正在调整对应的点
   const rawImgRef = useRef<HTMLImageElement | null>(null); // 原始图片对象
   const imgNaturalRef = useRef<{w:number,h:number} | null>(null);
 
@@ -148,25 +149,40 @@ export default function App() {
     for (let i = 0; i < pts.length; i++) {
       const cx = pts[i].x / scaleX;
       const cy = pts[i].y / scaleY;
+      const isAdjusting = i === adjustingIdx;
+      const curColor = colors[i];
+
+      // 微调中的点：先画外发光环
+      if (isAdjusting) {
+        ctx.beginPath();
+        ctx.arc(cx, cy, dotR * 2.2, 0, Math.PI * 2);
+        ctx.strokeStyle = curColor;
+        ctx.lineWidth = lw * 2;
+        ctx.globalAlpha = 0.35;
+        ctx.stroke();
+        ctx.globalAlpha = 1.0;
+      }
+
       // 空心圈
       ctx.beginPath();
-      ctx.arc(cx, cy, dotR, 0, Math.PI * 2);
-      ctx.strokeStyle = colors[i];
-      ctx.lineWidth = lw + 0.5;
+      ctx.arc(cx, cy, isAdjusting ? dotR * 1.3 : dotR, 0, Math.PI * 2);
+      ctx.strokeStyle = curColor;
+      ctx.lineWidth = isAdjusting ? lw + 2 : lw + 0.5;
       ctx.stroke();
       // 十字线
+      const cl = isAdjusting ? crossLen * 1.4 : crossLen;
       ctx.beginPath();
-      ctx.moveTo(cx - crossLen, cy);
-      ctx.lineTo(cx + crossLen, cy);
-      ctx.moveTo(cx, cy - crossLen);
-      ctx.lineTo(cx, cy + crossLen);
-      ctx.strokeStyle = colors[i];
-      ctx.lineWidth = lw;
+      ctx.moveTo(cx - cl, cy);
+      ctx.lineTo(cx + cl, cy);
+      ctx.moveTo(cx, cy - cl);
+      ctx.lineTo(cx, cy + cl);
+      ctx.strokeStyle = curColor;
+      ctx.lineWidth = isAdjusting ? lw + 1 : lw;
       ctx.stroke();
       // 中心小点
       ctx.beginPath();
-      ctx.arc(cx, cy, 1.5, 0, Math.PI * 2);
-      ctx.fillStyle = colors[i];
+      ctx.arc(cx, cy, isAdjusting ? 3 : 1.5, 0, Math.PI * 2);
+      ctx.fillStyle = curColor;
       ctx.fill();
     }
 
@@ -218,7 +234,7 @@ export default function App() {
       ctx.font = `bold ${Math.round(20 * fs)}px -apple-system, sans-serif`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      const txt = `${angle.toFixed(1)}°`;
+      const txt = `${angle.toFixed(2)}°`;
       const tm = ctx.measureText(txt);
       const pad = 6 * fs;
       ctx.fillStyle = 'rgba(0,0,0,0.7)';
@@ -229,41 +245,79 @@ export default function App() {
   };
 
   // ============================================================
-  //  手动模式 Canvas 点击
+  //  手动模式 Canvas 点击（含微调功能）
   // ============================================================
   const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (mode !== 'manual') return;
-    if (manualPoints.length >= 3) return;
-
     const canvas = canvasRef.current;
     if (!canvas || !imgNaturalRef.current) return;
 
     const rect = canvas.getBoundingClientRect();
-    const scaleX = imgNaturalRef.current.w / canvas.width;
-    const scaleY = imgNaturalRef.current.h / canvas.height;
+    // === 修复1: 用 rect.width/height (CSS显示尺寸) 代替 canvas.width/height ===
+    const scaleX = imgNaturalRef.current.w / rect.width;
+    const scaleY = imgNaturalRef.current.h / rect.height;
     const imgX = Math.round((e.clientX - rect.left) * scaleX);
     const imgY = Math.round((e.clientY - rect.top) * scaleY);
 
+    // --- 情况A: 正在微调中，把当前点移到新位置 ---
+    if (adjustingIdx >= 0) {
+      const newPts = manualPoints.map((p, i) =>
+        i === adjustingIdx ? { x: imgX, y: imgY } : p
+      );
+      setManualPoints(newPts);
+      setAdjustingIdx(-1);
+      // 重绘
+      redrawCanvas(newPts);
+      return;
+    }
+
+    // --- 情况B: 3 个点已齐全，检测是否点击到已有点（进入微调模式） ---
+    if (manualPoints.length === 3) {
+      const clickDist = 30; // 像素阈值（原始图片坐标）
+      for (let i = 0; i < 3; i++) {
+        const dx = manualPoints[i].x - imgX;
+        const dy = manualPoints[i].y - imgY;
+        if (Math.sqrt(dx * dx + dy * dy) < clickDist) {
+          setAdjustingIdx(i);
+          setStatus(`微调第 ${i + 1} 个点 — 点击新位置即可移动`);
+          return;
+        }
+      }
+      return; // 没点到任何已有点，忽略
+    }
+
+    // --- 情况C: 正常添加点 ---
+    if (manualPoints.length >= 3) return;
     const newPts = [...manualPoints, { x: imgX, y: imgY }];
     setManualPoints(newPts);
+    redrawCanvas(newPts);
 
-    // 重绘 canvas
+    // 状态提示
+    if (newPts.length < 3) {
+      setStatus(`已选 ${newPts.length}/3 个点，继续点击`);
+    } else {
+      setStatus('测量完成！可点击已有点进行微调');
+    }
+  };
+
+  // 手动模式重绘 canvas 辅助函数
+  const redrawCanvas = (pts: Array<{x:number,y:number}>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    // 重新绘制底图
     const img = rawImgRef.current;
-    if (img) {
-      // 由于 canvas 尺寸可能和底图不同，需要绘制缩放版本
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      // 绘制缩放到 canvas 尺寸的图片
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-    }
-    drawAnnotations(ctx, canvas.width, canvas.height, newPts);
+    if (!img) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    drawAnnotations(ctx, canvas.width, canvas.height, pts);
   };
 
   const resetManualPoints = () => {
     setManualPoints([]);
     setManualAngle(null);
+    setAdjustingIdx(-1);
+    setStatus('请在图片上点击 3 个点');
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
@@ -302,6 +356,7 @@ export default function App() {
     setMode(newMode);
     setManualPoints([]);
     setManualAngle(null);
+    setAdjustingIdx(-1);
     setAngleResult(null);
 
     if (newMode === 'manual' && imageSrc && rawImgRef.current) {
@@ -461,7 +516,10 @@ export default function App() {
             display: imageSrc ? 'block' : 'none',
             maxWidth: '100%',
             maxHeight: '100%',
-            cursor: mode === 'manual' && manualPoints.length < 3 ? 'crosshair' : 'default'
+            cursor: mode === 'manual' && manualPoints.length < 3 ? 'crosshair'
+                    : mode === 'manual' && adjustingIdx >= 0 ? 'move'
+                    : mode === 'manual' ? 'pointer'
+                    : 'default'
           }}
           onClick={handleCanvasClick}
         />
@@ -484,12 +542,14 @@ export default function App() {
 
       {/* 手动模式步骤指引 */}
       {mode === 'manual' && imageSrc && (
-        <div className="flex justify-center gap-2 mb-2 text-xs">
+        <div className="flex flex-wrap justify-center gap-2 mb-2 text-xs">
           {stepLabels.map((label, i) => (
             <span
               key={i}
               className={`px-3 py-1 rounded-full font-medium transition-all ${
-                i < manualPoints.length
+                i === adjustingIdx
+                  ? 'bg-yellow-100 text-yellow-700 border border-yellow-400 ring-2 ring-yellow-300'
+                  : i < manualPoints.length
                   ? 'bg-green-100 text-green-700 border border-green-300'
                   : i === manualPoints.length
                   ? 'bg-blue-100 text-blue-700 border border-blue-300 animate-pulse'
@@ -499,6 +559,14 @@ export default function App() {
               {label}
             </span>
           ))}
+          {adjustingIdx >= 0 && (
+            <button
+              onClick={() => { setAdjustingIdx(-1); setStatus('测量完成！可点击已有点进行微调'); }}
+              className="px-3 py-1 rounded-full font-medium text-red-600 bg-red-50 border border-red-200 hover:bg-red-100 active:scale-95 transition-all"
+            >
+              ✕ 取消微调
+            </button>
+          )}
         </div>
       )}
 
