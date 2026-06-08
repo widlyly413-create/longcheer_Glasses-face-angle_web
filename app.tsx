@@ -339,7 +339,7 @@ export default function App() {
       if (!blob) return;
       const link = document.createElement('a');
       link.href = URL.createObjectURL(blob);
-      const angle = manualAngle?.toFixed(1) ?? 'unknown';
+      const angle = manualAngle?.toFixed(2) ?? 'unknown';
       link.download = `manual_angle_${angle}deg.png`;
       document.body.appendChild(link);
       link.click();
