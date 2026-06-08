@@ -1,498 +1,668 @@
-// cv.worker.ts
-// 在 Web Worker 环境中加载 OpenCV.js（Worker 是独立线程，无法访问主线程全局变量）
-importScripts('https://docs.opencv.org/4.7.0/opencv.js');
+import React, { useState, useRef, useCallback } from 'react';
+import { createRoot } from 'react-dom/client';
 
-declare var cv: any;
+// ============================================================
+//  角度计算（手动模式）
+// ============================================================
+function calcAngle(pL: {x:number,y:number}, pM: {x:number,y:number}, pR: {x:number,y:number}) {
+  const v1 = { x: pL.x - pM.x, y: pL.y - pM.y };
+  const v2 = { x: pR.x - pM.x, y: pR.y - pM.y };
+  const dot = v1.x * v2.x + v1.y * v2.y;
+  const mag1 = Math.sqrt(v1.x * v1.x + v1.y * v1.y);
+  const mag2 = Math.sqrt(v2.x * v2.x + v2.y * v2.y);
+  const cos = Math.max(-1, Math.min(1, dot / (mag1 * mag2)));
+  return Math.acos(cos) * 180 / Math.PI;
+}
 
-// 监听主线程发送的图片数据
-self.onmessage = async (e: MessageEvent) => {
-  const { imageSrc, userId } = e.data;
-  
-  try {
-    // 1. 等待 OpenCV 初始化完成
-    if (typeof cv === 'undefined' || !cv.Mat) {
-      await new Promise<void>((resolve) => {
-        const checkReady = () => {
-          if (typeof cv !== 'undefined' && cv.Mat) {
-            resolve();
-          } else {
-            setTimeout(checkReady, 100);
-          }
-        };
-        checkReady();
-      });
+export default function App() {
+  // ============================================================
+  //  已有状态（自动模式）
+  // ============================================================
+  const [imageSrc, setImageSrc] = useState<string | null>(null);
+  const [angleResult, setAngleResult] = useState<number | null>(null);
+  const [status, setStatus] = useState<string>('等待载入眼镜图像');
+  const [loading, setLoading] = useState<boolean>(false);
+  const [userId, setUserId] = useState<string>('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  // ============================================================
+  //  手动模式状态
+  // ============================================================
+  const [mode, setMode] = useState<'auto' | 'manual'>('auto');
+  const [manualPoints, setManualPoints] = useState<Array<{x:number,y:number}>>([]);
+  const [manualAngle, setManualAngle] = useState<number | null>(null);
+  const [draggingIdx, setDraggingIdx] = useState<number>(-1);
+  const dragRef = useRef<{points: Array<{x:number,y:number}>;}>({ points: [] });
+  const rawImgRef = useRef<HTMLImageElement | null>(null); // 原始图片对象
+  const imgNaturalRef = useRef<{w:number,h:number} | null>(null);
+
+  // 步骤文字
+  const stepLabels = ['① 点击左边框拐角', '② 点击鼻梁正中', '③ 点击右边框拐角'];
+
+  // ============================================================
+  //  图片上传（同时兼容两种模式）
+  // ============================================================
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setLoading(true);
+    setStatus('正在载入图像...');
+    setAngleResult(null);
+    setManualPoints([]);
+    setManualAngle(null);
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const img = new Image();
+      img.onload = () => {
+        // 压缩至 1200px 以内
+        const MAX_WIDTH = 1200;
+        let width = img.width;
+        let height = img.height;
+        if (width > MAX_WIDTH) {
+          height = Math.round((height * MAX_WIDTH) / width);
+          width = MAX_WIDTH;
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx?.drawImage(img, 0, 0, width, height);
+        const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.85);
+
+        // 存储原始图片信息
+        rawImgRef.current = img;
+        imgNaturalRef.current = { w: img.width, h: img.height };
+
+        setImageSrc(compressedDataUrl);
+        setLoading(false);
+
+        if (mode === 'auto') {
+          setStatus('图像优化完成，正在进行骨架级联解算...');
+          drawBaseImageToCanvas(compressedDataUrl);
+          runAnalysis(compressedDataUrl, userId);
+        } else {
+          setStatus('请在图片上点击 3 个点');
+          drawImageToCanvas(compressedDataUrl, width, height);
+        }
+      };
+      img.src = event.target?.result as string;
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // ============================================================
+  //  Canvas 绘制：自动模式 - 原始底图
+  // ============================================================
+  const drawBaseImageToCanvas = (dataUrl: string) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d');
+      ctx?.drawImage(img, 0, 0);
+    };
+    img.src = dataUrl;
+  };
+
+  // ============================================================
+  //  Canvas 绘制：手动模式 - 图片 + 标注
+  // ============================================================
+  const drawImageToCanvas = useCallback((dataUrl: string, w: number, h: number) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.drawImage(img, 0, 0, w, h);
+      // 已有点的标注由 drawAnnotations 负责
+      drawAnnotations(ctx, w, h, []);
+    };
+    img.src = dataUrl;
+  }, []);
+
+  // ============================================================
+  //  绘制手动模式的标注
+  // ============================================================
+  const drawAnnotations = (ctx: CanvasRenderingContext2D, cw: number, ch: number, pts: Array<{x:number,y:number}>, highlightIdx: number = -1) => {
+    const imgNat = imgNaturalRef.current;
+    if (!imgNat) return;
+
+    // 计算 canvas 坐标 ↔ 图片坐标 的缩放比
+    const scaleX = imgNat.w / cw;
+    const scaleY = imgNat.h / ch;
+
+    const fs = Math.max(0.7, cw / 900);
+    const dotR = Math.max(7, Math.round(9 * fs));
+    const crossLen = Math.max(9, Math.round(13 * fs));
+    const lw = Math.max(1.5, Math.round(1.5 * fs));
+
+    const colors = ['#00c853', '#ff1744', '#2979ff'];
+
+    // 绘制已点击的点
+    for (let i = 0; i < pts.length; i++) {
+      const cx = pts[i].x / scaleX;
+      const cy = pts[i].y / scaleY;
+      const isAdjusting = i === highlightIdx;
+      const curColor = colors[i];
+
+      // 微调中的点：先画外发光环
+      if (isAdjusting) {
+        ctx.beginPath();
+        ctx.arc(cx, cy, dotR * 2.2, 0, Math.PI * 2);
+        ctx.strokeStyle = curColor;
+        ctx.lineWidth = lw * 2;
+        ctx.globalAlpha = 0.35;
+        ctx.stroke();
+        ctx.globalAlpha = 1.0;
+      }
+
+      // 空心圈
+      ctx.beginPath();
+      ctx.arc(cx, cy, isAdjusting ? dotR * 1.3 : dotR, 0, Math.PI * 2);
+      ctx.strokeStyle = curColor;
+      ctx.lineWidth = isAdjusting ? lw + 2 : lw + 0.5;
+      ctx.stroke();
+      // 十字线
+      const cl = isAdjusting ? crossLen * 1.4 : crossLen;
+      ctx.beginPath();
+      ctx.moveTo(cx - cl, cy);
+      ctx.lineTo(cx + cl, cy);
+      ctx.moveTo(cx, cy - cl);
+      ctx.lineTo(cx, cy + cl);
+      ctx.strokeStyle = curColor;
+      ctx.lineWidth = isAdjusting ? lw + 1 : lw;
+      ctx.stroke();
+      // 中心小点
+      ctx.beginPath();
+      ctx.arc(cx, cy, isAdjusting ? 3 : 1.5, 0, Math.PI * 2);
+      ctx.fillStyle = curColor;
+      ctx.fill();
     }
 
-    // 2. 将前端传入的图片 URL 转为 ImageData 并载入成 OpenCV 的 Mat 矩阵
-    const imgData = await fetchImageData(imageSrc);
-    let rgba = cv.matFromImageData(imgData);
-    let h = rgba.rows;
-    let w = rgba.cols;
-    
-    // 【关键修复】将 RGBA 转为 BGR，与 Python cv2.imread 的 BGR 格式一致
-    // 这样后续 cv.split 得到的顺序就是 B=0, G=1, R=2
-    let src = new cv.Mat();
-    cv.cvtColor(rgba, src, cv.COLOR_RGBA2BGR);
-    rgba.delete(); // 释放 RGBA 矩阵
-    
-    // 3. 根据手机屏幕分辨率动态计算人因工程制图参数
-    const dynRadius = Math.max(5, Math.floor(w / 150));      
-    const dynLine = Math.max(2, Math.floor(w / 500));        
-    
-    // 4. 执行级联策略：先 V27（严格），失败则 V28（容错）
-    const MIN_ANGLE = 168.0;
-    
-    // 先尝试 V27
-    const resultV27 = runV27(src, w, h, MIN_ANGLE);
-    
-    if (resultV27.success) {
-      drawMetrics(src, resultV27.bestSet, resultV27.angle, dynLine, dynRadius, userId);
-      sendResult(src, true, resultV27.angle, "V27", `成功（V27）`);
+    // 连线（2个点以上）
+    if (pts.length >= 2) {
+      const p_m = pts[Math.min(1, pts.length - 1)];
+      const others = pts.length === 3 ? [pts[0], pts[2]] : [pts[0]];
+      for (const p of others) {
+        if (p === p_m) continue;
+        ctx.beginPath();
+        ctx.moveTo(p_m.x / scaleX, p_m.y / scaleY);
+        ctx.lineTo(p.x / scaleX, p.y / scaleY);
+        ctx.strokeStyle = '#ff6d00';
+        ctx.lineWidth = lw;
+        ctx.setLineDash([Math.round(7 * fs), Math.round(3 * fs)]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+
+    // 3 个点齐全：角度弧线和文字
+    if (pts.length === 3) {
+      const angle = calcAngle(pts[0], pts[1], pts[2]);
+      setManualAngle(angle);
+
+      const p_m = pts[1];
+      const cx = p_m.x / scaleX, cy = p_m.y / scaleY;
+      const v1 = { x: pts[0].x - p_m.x, y: pts[0].y - p_m.y };
+      const v2 = { x: pts[2].x - p_m.x, y: pts[2].y - p_m.y };
+      const a1 = Math.atan2(v1.y, v1.x);
+      const a2 = Math.atan2(v2.y, v2.x);
+      let startA = a1, endA = a2;
+      let diff = endA - startA;
+      if (diff < 0) diff += Math.PI * 2;
+      if (diff > Math.PI) [startA, endA] = [endA, startA];
+
+      const arcR = Math.min(70, Math.max(35, cw * 0.07));
+      ctx.beginPath();
+      ctx.arc(cx, cy, arcR, startA, endA);
+      ctx.strokeStyle = '#ff1744';
+      ctx.lineWidth = lw + 1;
+      ctx.stroke();
+
+      // 角度文字
+      const midA = (startA + endA) / 2;
+      const textR = arcR + 25 * fs;
+      const tx = cx + Math.cos(midA) * textR;
+      const ty = cy + Math.sin(midA) * textR;
+      ctx.font = `bold ${Math.round(20 * fs)}px -apple-system, sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      const txt = `${angle.toFixed(2)}°`;
+      const tm = ctx.measureText(txt);
+      const pad = 6 * fs;
+      ctx.fillStyle = 'rgba(0,0,0,0.7)';
+      ctx.fillRect(tx - tm.width/2 - pad, ty - 13*fs - pad, tm.width + pad*2, 26*fs + pad*2);
+      ctx.fillStyle = '#ff1744';
+      ctx.fillText(txt, tx, ty);
+    }
+  };
+
+  // ============================================================
+  //  手动模式 Pointer Events（点击选点 + 拖动微调）
+  // ============================================================
+  const getImgCoords = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas || !imgNaturalRef.current) return null;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = imgNaturalRef.current.w / rect.width;
+    const scaleY = imgNaturalRef.current.h / rect.height;
+    return {
+      x: Math.round((e.clientX - rect.left) * scaleX),
+      y: Math.round((e.clientY - rect.top) * scaleY),
+    };
+  };
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (mode !== 'manual') return;
+    const coords = getImgCoords(e);
+    if (!coords) return;
+    const { x: imgX, y: imgY } = coords;
+
+    // --- 已选完 3 个点：检测是否按住已有点，开始拖动 ---
+    if (manualPoints.length === 3) {
+      const threshold = 30;
+      for (let i = 0; i < 3; i++) {
+        const dx = manualPoints[i].x - imgX;
+        const dy = manualPoints[i].y - imgY;
+        if (Math.sqrt(dx * dx + dy * dy) < threshold) {
+          dragRef.current = { points: [...manualPoints] };
+          setDraggingIdx(i);
+          setStatus(`拖动第 ${i + 1} 个点进行微调`);
+          return;
+        }
+      }
+      return;
+    }
+
+    // --- 正常添加点 ---
+    if (manualPoints.length >= 3) return;
+    const newPts = [...manualPoints, { x: imgX, y: imgY }];
+    setManualPoints(newPts);
+    redrawCanvas(newPts);
+
+    if (newPts.length < 3) {
+      setStatus(`已选 ${newPts.length}/3 个点，继续点击`);
     } else {
-      // V27 失败，尝试 V28
-      const resultV28 = runV28(src, w, h, MIN_ANGLE);
+      setStatus('✅ 测量完成 — 拖动任意点进行微调');
+    }
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (draggingIdx < 0) return;
+    const coords = getImgCoords(e);
+    if (!coords) return;
+
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const img = rawImgRef.current;
+    if (!img) return;
+
+    // 实时更新 ref 中的点位置，直接绘制（不触发 React 重渲染，流畅拖动）
+    const newPts = dragRef.current.points.map((p, i) =>
+      i === draggingIdx ? coords : p
+    );
+    dragRef.current.points = newPts;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    drawAnnotations(ctx, canvas.width, canvas.height, newPts, draggingIdx);
+  };
+
+  const handlePointerUp = (_e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (draggingIdx < 0) return;
+    const finalPts = dragRef.current.points;
+    setManualPoints(finalPts);
+    setDraggingIdx(-1);
+    setStatus('✅ 微调完成 — 拖动任意点继续微调');
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const img = rawImgRef.current;
+    if (!img) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    drawAnnotations(ctx, canvas.width, canvas.height, finalPts);
+  };
+
+  // 手动模式重绘 canvas 辅助函数
+  const redrawCanvas = (pts: Array<{x:number,y:number}>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const img = rawImgRef.current;
+    if (!img) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    drawAnnotations(ctx, canvas.width, canvas.height, pts);
+  };
+
+  const resetManualPoints = () => {
+    setManualPoints([]);
+    setManualAngle(null);
+    setDraggingIdx(-1);
+    setStatus('请在图片上点击 3 个点');
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const img = rawImgRef.current;
+    if (img) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    }
+  };
+
+  // ============================================================
+  //  手动模式：保存结果图
+  // ============================================================
+  const handleManualSave = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.toBlob((blob) => {
+      if (!blob) return;
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      const angle = manualAngle?.toFixed(2) ?? 'unknown';
+      link.download = `manual_angle_${angle}deg.png`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(link.href);
+    }, 'image/png');
+  };
+
+  // ============================================================
+  //  模式切换
+  // ============================================================
+  const switchMode = (newMode: 'auto' | 'manual') => {
+    if (newMode === mode) return;
+    setMode(newMode);
+    setManualPoints([]);
+    setManualAngle(null);
+    setDraggingIdx(-1);
+    setAngleResult(null);
+
+    if (newMode === 'manual' && imageSrc && rawImgRef.current) {
+      setStatus('请在图片上点击 3 个点');
+      const canvas = canvasRef.current;
+      if (canvas) {
+        const imgNat = imgNaturalRef.current;
+        if (imgNat) {
+          // 保持 canvas 尺寸与压缩后的图片一致
+          const MAX_WIDTH = 1200;
+          let w = imgNat.w, h = imgNat.h;
+          if (w > MAX_WIDTH) {
+            h = Math.round((h * MAX_WIDTH) / w);
+            w = MAX_WIDTH;
+          }
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.drawImage(rawImgRef.current, 0, 0, w, h);
+          }
+        }
+      }
+    } else if (newMode === 'auto' && imageSrc) {
+      setStatus('图像优化完成，正在进行骨架级联解算...');
+      drawBaseImageToCanvas(imageSrc);
+      runAnalysis(imageSrc, userId);
+    }
+  };
+
+  // ============================================================
+  //  自动分析（原方法保持不变）
+  // ============================================================
+  const runAnalysis = (src: string, uid: string) => {
+    setLoading(true);
+    setStatus('级联核心策略运行中...');
+    
+    const worker = new Worker(new URL('./cv.worker.ts', import.meta.url));
+    worker.postMessage({ imageSrc: src, userId: uid });
+    
+    worker.onmessage = (e) => {
+      const { success, angle, msg, version, rgbaData, width, height } = e.data;
+      setLoading(false);
       
-      if (resultV28.success) {
-        drawMetrics(src, resultV28.bestSet, resultV28.angle, dynLine, dynRadius, userId);
-        sendResult(src, true, resultV28.angle, "V28", `成功（V28）`);
+      if (success) {
+        setStatus(`测量成功！系统判别：${version}`);
+        setAngleResult(angle);
+        
+        const canvas = canvasRef.current;
+        if (canvas) {
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            const imgData = ctx.createImageData(width, height);
+            imgData.data.set(rgbaData);
+            ctx.putImageData(imgData, 0, 0);
+          }
+        }
       } else {
-        sendResult(src, false, 0, "失败", "未组合出符合眼镜特征的骨架。请确保眼镜水平正对镜头，并重新拍照。");
+        setStatus('分析未通过');
+        setAngleResult(null);
+        alert(`⚠️ 测量失败\n\n原因：${msg}`);
       }
+      worker.terminate();
+    };
+
+    worker.onerror = () => {
+      setLoading(false);
+      setStatus('计算异常');
+      alert('算法并发异常，请尝试重新拍摄。');
+      worker.terminate();
+    };
+  };
+
+  // ============================================================
+  //  重新拍摄
+  // ============================================================
+  const handleRetake = () => {
+    setImageSrc(null);
+    setAngleResult(null);
+    setManualPoints([]);
+    setManualAngle(null);
+    setDraggingIdx(-1);
+    setStatus('等待载入眼镜图像');
+    rawImgRef.current = null;
+    imgNaturalRef.current = null;
+    const canvas = canvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext('2d');
+      if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
     }
-    
-    src.delete();
-    
-  } catch (error) {
-    self.postMessage({
-      success: false,
-      angle: 0,
-      version: "错误",
-      msg: "图像解析异常，请尝试重新拍照。"
-    });
-  }
-};
+  };
 
-function sendResult(src: any, success: boolean, angle: number, version: string, msg: string) {
-  const dstImgData = matToImageData(src);
-  self.postMessage({
-    success,
-    angle,
-    version,
-    msg,
-    rgbaData: dstImgData.data,
-    width: dstImgData.width,
-    height: dstImgData.height
-  }, [dstImgData.data.buffer as ArrayBuffer]);
-}
+  // ============================================================
+  //  自动模式保存
+  // ============================================================
+  const handleAutoSave = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.toBlob((blob) => {
+      if (!blob) return;
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      const timestamp = new Date().toISOString().slice(0, 19).replace(/[:-]/g, '');
+      const fileName = userId ? `${userId}.jpg` : `face_angle_${timestamp}.jpg`;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(link.href);
+    }, 'image/jpeg', 0.95);
+  };
 
-// ================= V27 算法（严格模式） =================
-// 对应 Python process_image_v27: 3 层 RGB 阈值 + balance_err > 0.15 过滤
-function runV27(src: any, w: number, h: number, minAngle: number) {
-  // 分离 BGR 通道
-  let bgrPlanes = new cv.MatVector();
-  cv.split(src, bgrPlanes);
-  let b = bgrPlanes.get(0);
-  let g = bgrPlanes.get(1);
-  let r = bgrPlanes.get(2);
-  
-  let rgDiff = new cv.Mat();
-  let rbDiff = new cv.Mat();
-  cv.subtract(r, g, rgDiff);
-  cv.subtract(r, b, rbDiff);
-  
-  const cascadeThresholds = [
-    { rg: 75, rb: 45, r: 120, circ: 0.55, areaMin: 12 },
-    { rg: 55, rb: 40, r: 100, circ: 0.45, areaMin: 10 },
-    { rg: 40, rb: 30, r: 80,  circ: 0.35, areaMin: 8  }
-  ];
-  
-  const result = runCascadePasses(src, w, h, minAngle, cascadeThresholds, "rgb", {
-    areaMax: 2000,
-    morphSize: 5,
-    errorThreshold: 0.03,
-    balanceErrFilter: 0.15,   // V27 有平衡误差过滤
-    topN: 12
-  });
-  
-  b.delete(); g.delete(); r.delete(); bgrPlanes.delete();
-  rgDiff.delete(); rbDiff.delete();
-  
-  return result;
-}
+  // ============================================================
+  //  渲染
+  // ============================================================
+  return (
+    <div className="min-h-screen bg-gray-50 flex flex-col justify-between p-4 font-sans select-none">
+      {/* 状态看板 */}
+      <div className="bg-white p-4 rounded-2xl shadow-sm text-center">
+        <div className="flex items-center justify-between gap-2 mb-2">
+          <h1 className="text-xl font-bold text-gray-800 tracking-wide">面弯角精密测量系统</h1>
+          <input
+            type="text"
+            placeholder="用户编号"
+            value={userId}
+            onChange={(e) => setUserId(e.target.value)}
+            className="w-28 text-center text-sm border border-gray-300 rounded-lg py-1.5 px-2 focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-transparent"
+          />
+        </div>
 
-// ================= V28 算法（容错模式） =================
-// 对应 Python process_image_v28: 3 层 RGB + 2 层 HSV，无 balance_err 过滤
-function runV28(src: any, w: number, h: number, minAngle: number) {
-  // 分离 BGR 通道
-  let bgrPlanes = new cv.MatVector();
-  cv.split(src, bgrPlanes);
-  let b = bgrPlanes.get(0);
-  let g = bgrPlanes.get(1);
-  let r = bgrPlanes.get(2);
-  
-  let rgDiff = new cv.Mat();
-  let rbDiff = new cv.Mat();
-  cv.subtract(r, g, rgDiff);
-  cv.subtract(r, b, rbDiff);
-  
-  // HSV 颜色空间（V28 后两层使用）—— src 是 BGR 格式
-  let hsv = new cv.Mat();
-  cv.cvtColor(src, hsv, cv.COLOR_BGR2HSV);
-  
-  const cascadeThresholds = [
-    // 3 层 RGB（阈值比 V27 宽松）
-    { mode: "rgb", rg: 75, rb: 45, r: 120, circ: 0.55, areaMin: 12 },
-    { mode: "rgb", rg: 55, rb: 40, r: 100, circ: 0.40, areaMin: 8  },
-    { mode: "rgb", rg: 40, rb: 30, r: 80,  circ: 0.25, areaMin: 5  },
-    // 2 层 HSV 容错
-    { mode: "hsv", hLow: 0,   hHigh: 10,  sLow: 30, vLow: 60, circ: 0.20, areaMin: 3 },
-    { mode: "hsv", hLow: 165, hHigh: 180, sLow: 30, vLow: 60, circ: 0.20, areaMin: 3 }
-  ];
-  
-  const result = runCascadePassesV28(src, w, h, minAngle, cascadeThresholds, rgDiff, rbDiff, r, hsv);
-  
-  b.delete(); g.delete(); r.delete(); bgrPlanes.delete();
-  rgDiff.delete(); rbDiff.delete(); hsv.delete();
-  
-  return result;
-}
+        {/* 模式切换 */}
+        <div className="flex gap-1 mb-2 bg-gray-100 p-1 rounded-xl">
+          <button
+            onClick={() => switchMode('auto')}
+            className={`flex-1 py-1.5 text-xs font-semibold rounded-lg transition-all ${mode === 'auto' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500'}`}
+          >
+            🤖 自动检测
+          </button>
+          <button
+            onClick={() => switchMode('manual')}
+            className={`flex-1 py-1.5 text-xs font-semibold rounded-lg transition-all ${mode === 'manual' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500'}`}
+          >
+            👆 手动选点
+          </button>
+        </div>
 
-// ================= V28 级联执行（不传递 balanceErrFilter，RGB 无平衡误差过滤） =================
-function runCascadePassesV28(
-  src: any, w: number, h: number, minAngle: number,
-  thresholds: any[], rgDiff: any, rbDiff: any, r: any, hsv: any
-) {
-  let bestSet: any = null;
-  let minGeometricError = Infinity;
-  let finalAngle = 0;
+        <p className={`text-xs font-medium ${loading ? 'text-blue-500 animate-pulse' : 'text-gray-400'}`}>{status}</p>
+      </div>
 
-  for (let th of thresholds) {
-    let mask = new cv.Mat();
-    
-    if (th.mode === "rgb") {
-      let mask1 = new cv.Mat();
-      let mask2 = new cv.Mat();
-      let mask3 = new cv.Mat();
-      cv.threshold(rgDiff, mask1, th.rg, 255, cv.THRESH_BINARY);
-      cv.threshold(rbDiff, mask2, th.rb, 255, cv.THRESH_BINARY);
-      cv.threshold(r, mask3, th.r, 255, cv.THRESH_BINARY);
-      cv.bitwise_and(mask1, mask2, mask);
-      cv.bitwise_and(mask, mask3, mask);
-      mask1.delete(); mask2.delete(); mask3.delete();
-    } else {
-      let lowBound = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [th.hLow, th.sLow, th.vLow, 0]);
-      let highBound = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [th.hHigh, 255, 255, 255]);
-      cv.inRange(hsv, lowBound, highBound, mask);
-      lowBound.delete(); highBound.delete();
-    }
-    
-    // 形态学处理
-    let ksize = th.mode === "rgb" ? new cv.Size(5, 5) : new cv.Size(7, 7);
-    let kernelClose = cv.getStructuringElement(cv.MORPH_ELLIPSE, ksize);
-    cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernelClose);
-    kernelClose.delete();
-    
-    // HSV 层追加膨胀
-    if (th.mode === "hsv") {
-      let kernelDilate = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3, 3));
-      cv.dilate(mask, mask, kernelDilate, new cv.Point(-1, -1), 1);
-      kernelDilate.delete();
-    }
-    
-    // 提取轮廓
-    let contours = new cv.MatVector();
-    let hierarchy = new cv.Mat();
-    cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-    
-    let candidates: Array<{ cX: number, cY: number, area: number }> = [];
-    const areaMax = th.mode === "rgb" ? 2000 : 3000;
-    
-    for (let i = 0; i < contours.size(); ++i) {
-      let cnt = contours.get(i);
-      let area = cv.contourArea(cnt);
-      
-      if (area > th.areaMin && area < areaMax) {
-        let perimeter = cv.arcLength(cnt, true);
-        if (perimeter === 0) continue;
-        let circularity = (4 * Math.PI * area) / (perimeter * perimeter);
+      {/* 核心图形渲染区 */}
+      <div className="relative flex-1 my-4 bg-gray-900 rounded-3xl overflow-hidden flex items-center justify-center shadow-inner min-h-[300px]">
+        <canvas
+          ref={canvasRef}
+          className="max-w-full max-h-full w-auto h-auto object-contain"
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          style={{
+            display: imageSrc ? 'block' : 'none',
+            maxWidth: '100%',
+            maxHeight: '100%',
+            touchAction: 'none',
+            cursor: mode === 'manual' && draggingIdx >= 0 ? 'grabbing'
+                    : mode === 'manual' && manualPoints.length < 3 ? 'crosshair'
+                    : mode === 'manual' ? 'pointer'
+                    : 'default'
+          }}
+        />
         
-        if (circularity >= th.circ) {
-          let M = cv.moments(cnt);
-          if (M.m00 !== 0) {
-            let cX = Math.floor(M.m10 / M.m00);
-            let cY = Math.floor(M.m01 / M.m00);
-            if (0.02 * w < cX && cX < 0.98 * w && 0.02 * h < cY && cY < 0.98 * h) {
-              candidates.push({ cX, cY, area });
-            }
-          }
-        }
-      }
-    }
-    
-    candidates.sort((a, b) => b.area - a.area);
-    let pts = th.mode === "rgb" ? candidates.slice(0, 12) : candidates.slice(0, 15);
-    
-    if (pts.length >= 3) {
-      const errorThreshold = th.mode === "rgb" ? 0.03 : 0.02;
-      
-      for (let i = 0; i < pts.length - 2; i++) {
-        if (minGeometricError < errorThreshold) break;
-        for (let j = i + 1; j < pts.length - 1; j++) {
-          if (minGeometricError < errorThreshold) break;
-          for (let k = j + 1; k < pts.length; k++) {
-            let pA = pts[i], pB = pts[j], pC = pts[k];
-            
-            let dAB = Math.hypot(pA.cX - pB.cX, pA.cY - pB.cY);
-            let dBC = Math.hypot(pB.cX - pC.cX, pB.cY - pC.cY);
-            let dCA = Math.hypot(pC.cX - pA.cX, pC.cY - pA.cY);
-            
-            let dists = [dAB, dBC, dCA];
-            let maxDist = Math.max(...dists);
-            
-            if (maxDist < Math.min(w, h) * 0.30) continue;
-            
-            let p_mid, p1, p2;
-            if (maxDist === dAB) { p_mid = pC; p1 = pA; p2 = pB; }
-            else if (maxDist === dBC) { p_mid = pA; p1 = pB; p2 = pC; }
-            else { p_mid = pB; p1 = pA; p2 = pC; }
-            
-            let v1 = { x: p1.cX - p_mid.cX, y: p1.cY - p_mid.cY };
-            let v2 = { x: p2.cX - p_mid.cX, y: p2.cY - p_mid.cY };
-            
-            let dot = v1.x * v2.x + v1.y * v2.y;
-            let len1 = Math.hypot(v1.x, v1.y);
-            let len2 = Math.hypot(v2.x, v2.y);
-            let cosTheta = dot / (len1 * len2);
-            let angle = (Math.acos(Math.min(Math.max(cosTheta, -1.0), 1.0)) * 180) / Math.PI;
-            
-            if (angle < 160 || angle > 180) continue;
-            
-            let balanceErr = Math.abs(len1 - len2) / Math.max(len1, len2, 1);
-            
-            // 【关键】V28 的 RGB 层没有 balanceErr > 0.15 过滤
-            // 与 Python V28 完全一致：直接用 balanceErr 和 minGeometricError 比较
-            if (balanceErr < minGeometricError && angle >= minAngle) {
-              minGeometricError = balanceErr;
-              bestSet = [p1, p_mid, p2];
-              finalAngle = angle;
-            }
-          }
-        }
-      }
-    }
-    
-    mask.delete(); contours.delete(); hierarchy.delete();
-    if (bestSet) break;
-  }
-  
-  return { success: bestSet !== null, bestSet, angle: finalAngle };
-}
-
-// ================= 通用级联执行（用于 V27） =================
-function runCascadePasses(
-  src: any, w: number, h: number, minAngle: number,
-  thresholds: any[], mode: string,
-  opts: { areaMax: number, morphSize: number, errorThreshold: number, balanceErrFilter?: number, topN: number }
-) {
-  // 重新获取通道和差值（因为 V27 和 V28 独立运行，src 是原始图像）
-  let bgrPlanes = new cv.MatVector();
-  cv.split(src, bgrPlanes);
-  let b = bgrPlanes.get(0);
-  let g = bgrPlanes.get(1);
-  let r = bgrPlanes.get(2);
-  
-  let rgDiff = new cv.Mat();
-  let rbDiff = new cv.Mat();
-  cv.subtract(r, g, rgDiff);
-  cv.subtract(r, b, rbDiff);
-
-  let bestSet: any = null;
-  let minGeometricError = Infinity;
-  let finalAngle = 0;
-
-  for (let th of thresholds) {
-    let mask = new cv.Mat();
-    
-    let mask1 = new cv.Mat();
-    let mask2 = new cv.Mat();
-    let mask3 = new cv.Mat();
-    cv.threshold(rgDiff, mask1, th.rg, 255, cv.THRESH_BINARY);
-    cv.threshold(rbDiff, mask2, th.rb, 255, cv.THRESH_BINARY);
-    cv.threshold(r, mask3, th.r, 255, cv.THRESH_BINARY);
-    cv.bitwise_and(mask1, mask2, mask);
-    cv.bitwise_and(mask, mask3, mask);
-    mask1.delete(); mask2.delete(); mask3.delete();
-    
-    // 形态学处理
-    let kernelClose = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(opts.morphSize, opts.morphSize));
-    cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernelClose);
-    kernelClose.delete();
-    
-    // 提取轮廓
-    let contours = new cv.MatVector();
-    let hierarchy = new cv.Mat();
-    cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-    
-    let candidates: Array<{ cX: number, cY: number, area: number }> = [];
-    
-    for (let i = 0; i < contours.size(); ++i) {
-      let cnt = contours.get(i);
-      let area = cv.contourArea(cnt);
-      
-      if (area > th.areaMin && area < opts.areaMax) {
-        let perimeter = cv.arcLength(cnt, true);
-        if (perimeter === 0) continue;
-        let circularity = (4 * Math.PI * area) / (perimeter * perimeter);
+        {!imageSrc && (
+          <div className="text-gray-500 text-center px-6 absolute pointer-events-none">
+            <div className="text-4xl mb-3">🕶️</div>
+            <p className="text-sm font-medium text-gray-400">请保持手机平行</p>
+            <p className="text-xs text-gray-600 mt-1">将智能眼镜水平置于视野中心拍照</p>
+          </div>
+        )}
         
-        if (circularity >= th.circ) {
-          let M = cv.moments(cnt);
-          if (M.m00 !== 0) {
-            let cX = Math.floor(M.m10 / M.m00);
-            let cY = Math.floor(M.m01 / M.m00);
-            if (0.02 * w < cX && cX < 0.98 * w && 0.02 * h < cY && cY < 0.98 * h) {
-              candidates.push({ cX, cY, area });
-            }
-          }
-        }
-      }
-    }
-    
-    candidates.sort((a, b) => b.area - a.area);
-    let pts = candidates.slice(0, opts.topN);
-    
-    if (pts.length >= 3) {
-      for (let i = 0; i < pts.length - 2; i++) {
-        if (minGeometricError < opts.errorThreshold) break;
-        for (let j = i + 1; j < pts.length - 1; j++) {
-          if (minGeometricError < opts.errorThreshold) break;
-          for (let k = j + 1; k < pts.length; k++) {
-            let pA = pts[i], pB = pts[j], pC = pts[k];
-            
-            let dAB = Math.hypot(pA.cX - pB.cX, pA.cY - pB.cY);
-            let dBC = Math.hypot(pB.cX - pC.cX, pB.cY - pC.cY);
-            let dCA = Math.hypot(pC.cX - pA.cX, pC.cY - pA.cY);
-            
-            let dists = [dAB, dBC, dCA];
-            let maxDist = Math.max(...dists);
-            
-            if (maxDist < Math.min(w, h) * 0.30) continue;
-            
-            let p_mid, p1, p2;
-            if (maxDist === dAB) { p_mid = pC; p1 = pA; p2 = pB; }
-            else if (maxDist === dBC) { p_mid = pA; p1 = pB; p2 = pC; }
-            else { p_mid = pB; p1 = pA; p2 = pC; }
-            
-            let v1 = { x: p1.cX - p_mid.cX, y: p1.cY - p_mid.cY };
-            let v2 = { x: p2.cX - p_mid.cX, y: p2.cY - p_mid.cY };
-            
-            let dot = v1.x * v2.x + v1.y * v2.y;
-            let len1 = Math.hypot(v1.x, v1.y);
-            let len2 = Math.hypot(v2.x, v2.y);
-            let cosTheta = dot / (len1 * len2);
-            let angle = (Math.acos(Math.min(Math.max(cosTheta, -1.0), 1.0)) * 180) / Math.PI;
-            
-            if (angle < 160 || angle > 180) continue;
-            
-            let balanceErr = Math.abs(len1 - len2) / Math.max(len1, len2, 1);
-            
-            // V27 的 balanceErr 过滤
-            if (opts.balanceErrFilter !== undefined && balanceErr > opts.balanceErrFilter) continue;
-            
-            if (balanceErr < minGeometricError && angle >= minAngle) {
-              minGeometricError = balanceErr;
-              bestSet = [p1, p_mid, p2];
-              finalAngle = angle;
-            }
-          }
-        }
-      }
-    }
-    
-    mask.delete(); contours.delete(); hierarchy.delete();
-    if (bestSet) break;
-  }
-  
-  b.delete(); g.delete(); r.delete(); bgrPlanes.delete();
-  rgDiff.delete(); rbDiff.delete();
-  
-  return { success: bestSet !== null, bestSet, angle: finalAngle };
+        {!imageSrc && (
+          <div className="absolute inset-8 border border-dashed border-gray-700 rounded-2xl pointer-events-none flex items-center justify-center">
+            <div className="w-full h-[1px] bg-gray-800"></div>
+            <div className="h-full w-[1px] bg-gray-800"></div>
+          </div>
+        )}
+      </div>
+
+      {/* 手动模式步骤指引 */}
+      {mode === 'manual' && imageSrc && (
+        <div className="flex flex-wrap justify-center gap-2 mb-2 text-xs">
+          {stepLabels.map((label, i) => (
+            <span
+              key={i}
+              className={`px-3 py-1 rounded-full font-medium transition-all ${
+                i === draggingIdx
+                  ? 'bg-yellow-100 text-yellow-700 border border-yellow-400 ring-2 ring-yellow-300'
+                  : i < manualPoints.length
+                  ? 'bg-green-100 text-green-700 border border-green-300'
+                  : i === manualPoints.length
+                  ? 'bg-blue-100 text-blue-700 border border-blue-300 animate-pulse'
+                  : 'bg-gray-100 text-gray-400 border border-gray-200'
+              }`}
+            >
+              {label}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* 控制面板 */}
+      <div className="bg-white p-5 rounded-3xl shadow-md space-y-4">
+        {/* 手动模式结果 */}
+        {mode === 'manual' && manualAngle !== null && (
+          <div className="text-center bg-gray-50 py-3 rounded-2xl border border-blue-50/50 animate-fade-in">
+            <span className="text-[10px] text-gray-400 block uppercase tracking-widest font-bold">Face Wrap Angle</span>
+            <span className="text-3xl font-black text-blue-600">{manualAngle.toFixed(2)}°</span>
+          </div>
+        )}
+
+        {/* 自动模式结果 */}
+        {mode === 'auto' && angleResult !== null && (
+          <div className="text-center bg-gray-50 py-3 rounded-2xl border border-blue-50/50 animate-fade-in">
+            <span className="text-[10px] text-gray-400 block uppercase tracking-widest font-bold">Face Wrap Angle</span>
+            <span className="text-3xl font-black text-blue-600">{angleResult.toFixed(2)}°</span>
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-3">
+          <input type="file" accept="image/*" capture="environment" ref={fileInputRef} onChange={handleFileChange} className="hidden" />
+          
+          <button onClick={() => fileInputRef.current?.click()} disabled={loading} className="py-4 bg-gray-900 disabled:bg-gray-100 disabled:text-gray-400 text-white font-semibold rounded-2xl active:scale-95 disabled:active:scale-100 transition-all flex flex-col items-center justify-center shadow-sm">
+            <span className="text-xl">📸</span>
+            <span className="text-xs mt-1">拍摄眼镜</span>
+          </button>
+          
+          <button onClick={handleRetake} disabled={!imageSrc || loading} className="py-4 bg-blue-600 disabled:bg-gray-100 disabled:text-gray-400 text-white font-semibold rounded-2xl active:scale-95 disabled:active:scale-100 transition-all flex flex-col items-center justify-center shadow-sm">
+            <span className="text-xl">🔄</span>
+            <span className="text-xs mt-1">重新拍摄</span>
+          </button>
+        </div>
+
+        {/* 手动模式：重置选点 + 保存 */}
+        {mode === 'manual' && manualPoints.length > 0 && (
+          <div className="grid grid-cols-2 gap-3">
+            <button onClick={resetManualPoints} className="w-full py-3 bg-gray-200 text-gray-700 font-semibold rounded-2xl active:scale-95 transition-all flex items-center justify-center gap-2 shadow-sm">
+              <span className="text-lg">↩️</span>
+              <span className="text-sm">重新选点</span>
+            </button>
+            {manualAngle !== null && (
+              <button onClick={handleManualSave} className="w-full py-3 bg-green-600 text-white font-semibold rounded-2xl active:scale-95 transition-all flex items-center justify-center gap-2 shadow-sm">
+                <span className="text-lg">💾</span>
+                <span className="text-sm">保存结果图</span>
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* 自动模式：保存按钮 */}
+        {mode === 'auto' && angleResult !== null && (
+          <button onClick={handleAutoSave} className="w-full py-3 bg-green-600 text-white font-semibold rounded-2xl active:scale-95 transition-all flex items-center justify-center gap-2 shadow-sm">
+            <span className="text-lg">💾</span>
+            <span className="text-sm">保存到相册{userId ? `（${userId}.jpg）` : ''}</span>
+          </button>
+        )}
+      </div>
+    </div>
+  );
 }
 
-// ================= 辅助可视化绘制 =================
-function drawMetrics(src: any, bestSet: any[], angle: number, dynLine: number, dynRadius: number, userId?: string) {
-  // 骨架线绘制
-  let p1 = new cv.Point(bestSet[0].cX, bestSet[0].cY);
-  let p_mid = new cv.Point(bestSet[1].cX, bestSet[1].cY);
-  let p2 = new cv.Point(bestSet[2].cX, bestSet[2].cY);
-  
-  cv.line(src, p1, p_mid, [255, 120, 0, 255], dynLine, cv.LINE_AA);
-  cv.line(src, p_mid, p2, [255, 120, 0, 255], dynLine, cv.LINE_AA);
-  
-  for (let p of [p1, p_mid, p2]) {
-    cv.circle(src, p, dynRadius, [0, 255, 255, 255], -1, cv.LINE_AA);
-    cv.circle(src, p, dynRadius, [0, 0, 0, 255], 1, cv.LINE_AA);
-  }
-  
-  // 动态计算字体大小和厚度（基于图像宽度，确保 CSS 缩放后仍可读）
-  const h = src.rows;
-  const w = src.cols;
-  const fontSize = Math.max(1.0, w / 550);     // 1200px 图 → ~2.2
-  const fontThick = Math.max(2, Math.floor(w / 400));  // 1200px 图 → 3
-  
-  // 【需求】在中间点 p_mid 附近绘制角度值（仅数字，无符号）
-  // 相对于 p_mid 的偏移量（向右上方偏移）
-  const offsetX = Math.floor(w * 0.03);
-  const offsetY = -Math.floor(h * 0.04);
-  // 确保不超出图像边界
-  let textX = p_mid.x + offsetX;
-  let textY = p_mid.y + offsetY;
-  textX = Math.max(Math.floor(w * 0.02), Math.min(textX, Math.floor(w * 0.7)));
-  textY = Math.max(Math.floor(h * 0.12), Math.min(textY, Math.floor(h * 0.88)));
-  
-  const lineHeight = Math.floor(fontSize * 28);  // 行高（像素）
-  
-  // 如果存在用户编号，在角度上方绘制（白色）
-  if (userId) {
-    const idText = `ID: ${userId}`;
-    // 黑色描边
-    cv.putText(src, idText, new cv.Point(textX, textY - lineHeight), cv.FONT_HERSHEY_SIMPLEX, fontSize, [0, 0, 0, 255], fontThick + 3, cv.LINE_AA);
-    // 白色文字
-    cv.putText(src, idText, new cv.Point(textX, textY - lineHeight), cv.FONT_HERSHEY_SIMPLEX, fontSize, [255, 255, 255, 255], fontThick, cv.LINE_AA);
-  }
-  
-  // 角度值（黄色）
-  const angleText = `${angle.toFixed(2)}`;
-  // 黑色描边
-  cv.putText(src, angleText, new cv.Point(textX, textY), cv.FONT_HERSHEY_SIMPLEX, fontSize, [0, 0, 0, 255], fontThick + 3, cv.LINE_AA);
-  // 黄色主文字（醒目）
-  cv.putText(src, angleText, new cv.Point(textX, textY), cv.FONT_HERSHEY_SIMPLEX, fontSize, [0, 255, 255, 255], fontThick, cv.LINE_AA);
-}
-
-// ================= 数据类型互转工具函数 =================
-async function fetchImageData(url: string): Promise<ImageData> {
-  const response = await fetch(url);
-  const blob = await response.blob();
-  const bitmap = await createImageBitmap(blob);
-  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-  const ctx = canvas.getContext('2d');
-  ctx?.drawImage(bitmap, 0, 0);
-  return ctx!.getImageData(0, 0, bitmap.width, bitmap.height);
-}
-
-function matToImageData(mat: any): ImageData {
-  // src 现在是 BGR（3 通道），需要转成 RGBA（4 通道）供前端显示
-  let rgb = new cv.Mat();
-  cv.cvtColor(mat, rgb, cv.COLOR_BGR2RGB);
-  // 补充 Alpha 通道（全不透明）
-  let rgba = new cv.Mat(rgb.rows, rgb.cols, cv.CV_8UC4);
-  let planes = new cv.MatVector();
-  cv.split(rgb, planes);
-  let alpha = new cv.Mat(rgb.rows, rgb.cols, cv.CV_8UC1, new cv.Scalar(255));
-  planes.push_back(alpha);
-  cv.merge(planes, rgba);
-  let imgData = new ImageData(new Uint8ClampedArray(rgba.data), rgba.cols, rgba.rows);
-  rgb.delete(); rgba.delete(); alpha.delete();
-  for (let i = 0; i < planes.size(); i++) planes.get(i).delete();
-  planes.delete();
-  return imgData;
+const rootElement = document.getElementById('root');
+if (rootElement) {
+  const root = createRoot(rootElement);
+  root.render(<App />);
 }
