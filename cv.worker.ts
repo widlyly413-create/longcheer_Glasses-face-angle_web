@@ -1,7 +1,7 @@
 // cv.worker.ts
 // 在 Web Worker 环境中加载 OpenCV.js（Worker 是独立线程，无法访问主线程全局变量）
-// 使用运行时路径，兼容 dev server / Vercel 部署 / 本地 file:// 三种场景
-var opencvPath = '/opencv.js';
+// file:// 协议下用相对路径，web 服务器下用绝对路径
+var opencvPath = (typeof location !== 'undefined' && location.protocol === 'file:') ? '../opencv.js' : '/opencv.js';
 importScripts(opencvPath);
 
 declare var cv: any;
