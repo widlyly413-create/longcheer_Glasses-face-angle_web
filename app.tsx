@@ -1,6 +1,7 @@
 import React, { useState, useRef, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 import heic2any from 'heic2any';
+import { Analytics } from '@vercel/analytics/react';
 
 // ============================================================
 //  角度计算（手动模式）
@@ -771,6 +772,7 @@ export default function App() {
           </button>
         )}
       </div>
+      <Analytics />
     </div>
   );
 }
