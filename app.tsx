@@ -1,5 +1,6 @@
 import React, { useState, useRef, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
+import { Analytics } from '@vercel/analytics/react';
 import heic2any from 'heic2any';
 
 // ============================================================
@@ -778,5 +779,10 @@ export default function App() {
 const rootElement = document.getElementById('root');
 if (rootElement) {
   const root = createRoot(rootElement);
-  root.render(<App />);
+  root.render(
+    <>
+      <App />
+      <Analytics />
+    </>
+  );
 }
