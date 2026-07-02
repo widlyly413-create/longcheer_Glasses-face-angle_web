@@ -1,6 +1,8 @@
 // cv.worker.ts
 // 在 Web Worker 环境中加载 OpenCV.js（Worker 是独立线程，无法访问主线程全局变量）
-importScripts(new URL('/opencv.js', (self as any).location?.href || '/').href);
+// 使用运行时路径，兼容 dev server / Vercel 部署 / 本地 file:// 三种场景
+var opencvPath = '/opencv.js';
+importScripts(opencvPath);
 
 declare var cv: any;
 
