@@ -38,6 +38,10 @@ export default function App() {
   const rawImgRef = useRef<HTMLImageElement | null>(null); // 原始图片对象
   const imgNaturalRef = useRef<{w:number,h:number} | null>(null);
 
+  // 拖拽上传状态
+  const [isDragOver, setIsDragOver] = useState(false);
+  const dragCounterRef = useRef(0);
+
   // 步骤文字
   const stepLabels = ['① 点击左边框拐角', '② 点击鼻梁正中', '③ 点击右边框拐角'];
 
@@ -127,6 +131,55 @@ export default function App() {
       processImageDataUrl(event.target?.result as string);
     };
     reader.readAsDataURL(file);
+  };
+
+  // ============================================================
+  //  拖拽上传事件
+  // ============================================================
+  const handleDragEnter = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current++;
+    if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+      setIsDragOver(true);
+    }
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current--;
+    if (dragCounterRef.current <= 0) {
+      dragCounterRef.current = 0;
+      setIsDragOver(false);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+    dragCounterRef.current = 0;
+
+    const files = e.dataTransfer.files;
+    if (files.length === 0) return;
+
+    const file = files[0];
+    if (!file.type.startsWith('image/')) {
+      alert('请拖入图片文件（JPG、PNG、HEIC 等格式）');
+      return;
+    }
+
+    // 通过 FileReader 构造一个模拟的 ChangeEvent 传给 handleFileChange
+    const fakeEvent = {
+      target: { files: [file] },
+    } as unknown as React.ChangeEvent<HTMLInputElement>;
+    handleFileChange(fakeEvent);
   };
 
   // ============================================================
@@ -466,9 +519,18 @@ export default function App() {
     setStatus('级联核心策略运行中...');
     
     const worker = new Worker(new URL('./cv.worker.ts', import.meta.url));
+    
+    const timeout = setTimeout(() => {
+      setLoading(false);
+      setStatus('计算超时');
+      alert('分析超时，OpenCV 引擎加载失败。请检查网络连接后重试。');
+      worker.terminate();
+    }, 30000);
+
     worker.postMessage({ imageSrc: src, userId: uid });
     
     worker.onmessage = (e) => {
+      clearTimeout(timeout);
       const { success, angle, msg, version, rgbaData, width, height } = e.data;
       setLoading(false);
       
@@ -495,10 +557,11 @@ export default function App() {
       worker.terminate();
     };
 
-    worker.onerror = () => {
+    worker.onerror = (err) => {
+      clearTimeout(timeout);
       setLoading(false);
       setStatus('计算异常');
-      alert('算法并发异常，请尝试重新拍摄。');
+      alert('OpenCV 视觉引擎加载失败，请检查网络连接后重试。\n\n提示：如持续失败，可切换至"手动选点"模式。');
       worker.terminate();
     };
   };
@@ -546,7 +609,22 @@ export default function App() {
   //  渲染
   // ============================================================
   return (
-    <div className="min-h-screen bg-gray-50 flex flex-col justify-between p-4 font-sans select-none">
+    <div
+      className="min-h-screen bg-gray-50 flex flex-col justify-between p-4 font-sans select-none relative"
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      {/* 拖拽上传覆盖层 */}
+      {isDragOver && (
+        <div className="absolute inset-0 z-50 bg-blue-500/90 flex flex-col items-center justify-center rounded-none pointer-events-none">
+          <div className="text-6xl mb-4">📥</div>
+          <p className="text-white text-xl font-bold">释放图片以导入</p>
+          <p className="text-blue-100 text-sm mt-2">支持 JPG、PNG、HEIC 格式</p>
+        </div>
+      )}
+
       {/* 状态看板 */}
       <div className="bg-white p-4 rounded-2xl shadow-sm text-center">
         <div className="flex items-center justify-between gap-2 mb-2">

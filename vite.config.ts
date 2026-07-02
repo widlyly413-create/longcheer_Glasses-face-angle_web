@@ -4,6 +4,6 @@ import react from '@vitejs/plugin-react';
 export default defineConfig({
   plugins: [react()],
   worker: {
-    format: 'es', // 保持 ES Module 格式，使 Worker 内部可以使用现代语法
+    format: 'iife', // 经典 Worker 格式，支持 importScripts 加载 OpenCV.js
   }
 });
