@@ -1,5 +1,6 @@
 import React, { useState, useRef, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
+import heic2any from 'heic2any';
 
 // ============================================================
 //  角度计算（手动模式）
@@ -32,7 +33,8 @@ export default function App() {
   const [mode, setMode] = useState<'auto' | 'manual'>('auto');
   const [manualPoints, setManualPoints] = useState<Array<{x:number,y:number}>>([]);
   const [manualAngle, setManualAngle] = useState<number | null>(null);
-  const [adjustingIdx, setAdjustingIdx] = useState<number>(-1); // -1=未调整, 0/1/2=正在调整对应的点
+  const [draggingIdx, setDraggingIdx] = useState<number>(-1);
+  const dragRef = useRef<{points: Array<{x:number,y:number}>;}>({ points: [] });
   const rawImgRef = useRef<HTMLImageElement | null>(null); // 原始图片对象
   const imgNaturalRef = useRef<{w:number,h:number} | null>(null);
 
@@ -42,7 +44,52 @@ export default function App() {
   // ============================================================
   //  图片上传（同时兼容两种模式）
   // ============================================================
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const isHeicFile = (file: File): boolean => {
+    const ext = file.name.split('.').pop()?.toLowerCase();
+    return ext === 'heic' || ext === 'heif' || file.type === 'image/heic' || file.type === 'image/heif';
+  };
+
+  const processImageDataUrl = (dataUrl: string) => {
+    const img = new Image();
+    img.onload = () => {
+      const MAX_WIDTH = 1200;
+      let width = img.width;
+      let height = img.height;
+      if (width > MAX_WIDTH) {
+        height = Math.round((height * MAX_WIDTH) / width);
+        width = MAX_WIDTH;
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx?.drawImage(img, 0, 0, width, height);
+      const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.85);
+
+      rawImgRef.current = img;
+      imgNaturalRef.current = { w: img.width, h: img.height };
+
+      setImageSrc(compressedDataUrl);
+      setLoading(false);
+
+      if (mode === 'auto') {
+        setStatus('图像优化完成，正在进行骨架级联解算...');
+        drawBaseImageToCanvas(compressedDataUrl);
+        runAnalysis(compressedDataUrl, userId);
+      } else {
+        setStatus('请在图片上点击 3 个点');
+        drawImageToCanvas(compressedDataUrl, width, height);
+      }
+    };
+    img.onerror = () => {
+      setLoading(false);
+      setStatus('图像解码失败，请重试');
+      alert('图像解码失败，请确认文件格式正确。');
+    };
+    img.src = dataUrl;
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -52,42 +99,32 @@ export default function App() {
     setManualPoints([]);
     setManualAngle(null);
 
+    if (isHeicFile(file)) {
+      setStatus('检测到 HEIC 格式，正在转换...');
+      try {
+        const convertedBlob = await heic2any({
+          blob: file,
+          toType: 'image/jpeg',
+          quality: 0.85,
+        });
+        const resultBlob = Array.isArray(convertedBlob) ? convertedBlob[0] : convertedBlob;
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          processImageDataUrl(event.target?.result as string);
+        };
+        reader.readAsDataURL(resultBlob);
+      } catch (err) {
+        setLoading(false);
+        setStatus('HEIC 转换失败');
+        alert('HEIC 格式转换失败，请尝试使用 JPG/PNG 格式的图片。');
+        console.error('HEIC conversion error:', err);
+      }
+      return;
+    }
+
     const reader = new FileReader();
     reader.onload = (event) => {
-      const img = new Image();
-      img.onload = () => {
-        // 压缩至 1200px 以内
-        const MAX_WIDTH = 1200;
-        let width = img.width;
-        let height = img.height;
-        if (width > MAX_WIDTH) {
-          height = Math.round((height * MAX_WIDTH) / width);
-          width = MAX_WIDTH;
-        }
-        const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        ctx?.drawImage(img, 0, 0, width, height);
-        const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.85);
-
-        // 存储原始图片信息
-        rawImgRef.current = img;
-        imgNaturalRef.current = { w: img.width, h: img.height };
-
-        setImageSrc(compressedDataUrl);
-        setLoading(false);
-
-        if (mode === 'auto') {
-          setStatus('图像优化完成，正在进行骨架级联解算...');
-          drawBaseImageToCanvas(compressedDataUrl);
-          runAnalysis(compressedDataUrl, userId);
-        } else {
-          setStatus('请在图片上点击 3 个点');
-          drawImageToCanvas(compressedDataUrl, width, height);
-        }
-      };
-      img.src = event.target?.result as string;
+      processImageDataUrl(event.target?.result as string);
     };
     reader.readAsDataURL(file);
   };
@@ -130,7 +167,7 @@ export default function App() {
   // ============================================================
   //  绘制手动模式的标注
   // ============================================================
-  const drawAnnotations = (ctx: CanvasRenderingContext2D, cw: number, ch: number, pts: Array<{x:number,y:number}>) => {
+  const drawAnnotations = (ctx: CanvasRenderingContext2D, cw: number, ch: number, pts: Array<{x:number,y:number}>, highlightIdx: number = -1) => {
     const imgNat = imgNaturalRef.current;
     if (!imgNat) return;
 
@@ -149,7 +186,7 @@ export default function App() {
     for (let i = 0; i < pts.length; i++) {
       const cx = pts[i].x / scaleX;
       const cy = pts[i].y / scaleY;
-      const isAdjusting = i === adjustingIdx;
+      const isAdjusting = i === highlightIdx;
       const curColor = colors[i];
 
       // 微调中的点：先画外发光环
@@ -245,59 +282,93 @@ export default function App() {
   };
 
   // ============================================================
-  //  手动模式 Canvas 点击（含微调功能）
+  //  手动模式 Pointer Events（点击选点 + 拖动微调）
   // ============================================================
-  const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (mode !== 'manual') return;
+  const getImgCoords = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
-    if (!canvas || !imgNaturalRef.current) return;
-
+    if (!canvas || !imgNaturalRef.current) return null;
     const rect = canvas.getBoundingClientRect();
-    // === 修复1: 用 rect.width/height (CSS显示尺寸) 代替 canvas.width/height ===
     const scaleX = imgNaturalRef.current.w / rect.width;
     const scaleY = imgNaturalRef.current.h / rect.height;
-    const imgX = Math.round((e.clientX - rect.left) * scaleX);
-    const imgY = Math.round((e.clientY - rect.top) * scaleY);
+    return {
+      x: Math.round((e.clientX - rect.left) * scaleX),
+      y: Math.round((e.clientY - rect.top) * scaleY),
+    };
+  };
 
-    // --- 情况A: 正在微调中，把当前点移到新位置 ---
-    if (adjustingIdx >= 0) {
-      const newPts = manualPoints.map((p, i) =>
-        i === adjustingIdx ? { x: imgX, y: imgY } : p
-      );
-      setManualPoints(newPts);
-      setAdjustingIdx(-1);
-      // 重绘
-      redrawCanvas(newPts);
-      return;
-    }
+  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (mode !== 'manual') return;
+    const coords = getImgCoords(e);
+    if (!coords) return;
+    const { x: imgX, y: imgY } = coords;
 
-    // --- 情况B: 3 个点已齐全，检测是否点击到已有点（进入微调模式） ---
+    // --- 已选完 3 个点：检测是否按住已有点，开始拖动 ---
     if (manualPoints.length === 3) {
-      const clickDist = 30; // 像素阈值（原始图片坐标）
+      const threshold = 30;
       for (let i = 0; i < 3; i++) {
         const dx = manualPoints[i].x - imgX;
         const dy = manualPoints[i].y - imgY;
-        if (Math.sqrt(dx * dx + dy * dy) < clickDist) {
-          setAdjustingIdx(i);
-          setStatus(`微调第 ${i + 1} 个点 — 点击新位置即可移动`);
+        if (Math.sqrt(dx * dx + dy * dy) < threshold) {
+          dragRef.current = { points: [...manualPoints] };
+          setDraggingIdx(i);
+          setStatus(`拖动第 ${i + 1} 个点进行微调`);
           return;
         }
       }
-      return; // 没点到任何已有点，忽略
+      return;
     }
 
-    // --- 情况C: 正常添加点 ---
+    // --- 正常添加点 ---
     if (manualPoints.length >= 3) return;
     const newPts = [...manualPoints, { x: imgX, y: imgY }];
     setManualPoints(newPts);
     redrawCanvas(newPts);
 
-    // 状态提示
     if (newPts.length < 3) {
       setStatus(`已选 ${newPts.length}/3 个点，继续点击`);
     } else {
-      setStatus('测量完成！可点击已有点进行微调');
+      setStatus('✅ 测量完成 — 拖动任意点进行微调');
     }
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (draggingIdx < 0) return;
+    const coords = getImgCoords(e);
+    if (!coords) return;
+
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const img = rawImgRef.current;
+    if (!img) return;
+
+    // 实时更新 ref 中的点位置，直接绘制（不触发 React 重渲染，流畅拖动）
+    const newPts = dragRef.current.points.map((p, i) =>
+      i === draggingIdx ? coords : p
+    );
+    dragRef.current.points = newPts;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    drawAnnotations(ctx, canvas.width, canvas.height, newPts, draggingIdx);
+  };
+
+  const handlePointerUp = (_e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (draggingIdx < 0) return;
+    const finalPts = dragRef.current.points;
+    setManualPoints(finalPts);
+    setDraggingIdx(-1);
+    setStatus('✅ 微调完成 — 拖动任意点继续微调');
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const img = rawImgRef.current;
+    if (!img) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    drawAnnotations(ctx, canvas.width, canvas.height, finalPts);
   };
 
   // 手动模式重绘 canvas 辅助函数
@@ -316,7 +387,7 @@ export default function App() {
   const resetManualPoints = () => {
     setManualPoints([]);
     setManualAngle(null);
-    setAdjustingIdx(-1);
+    setDraggingIdx(-1);
     setStatus('请在图片上点击 3 个点');
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -356,7 +427,7 @@ export default function App() {
     setMode(newMode);
     setManualPoints([]);
     setManualAngle(null);
-    setAdjustingIdx(-1);
+    setDraggingIdx(-1);
     setAngleResult(null);
 
     if (newMode === 'manual' && imageSrc && rawImgRef.current) {
@@ -440,6 +511,7 @@ export default function App() {
     setAngleResult(null);
     setManualPoints([]);
     setManualAngle(null);
+    setDraggingIdx(-1);
     setStatus('等待载入眼镜图像');
     rawImgRef.current = null;
     imgNaturalRef.current = null;
@@ -512,16 +584,19 @@ export default function App() {
         <canvas
           ref={canvasRef}
           className="max-w-full max-h-full w-auto h-auto object-contain"
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
           style={{
             display: imageSrc ? 'block' : 'none',
             maxWidth: '100%',
             maxHeight: '100%',
-            cursor: mode === 'manual' && manualPoints.length < 3 ? 'crosshair'
-                    : mode === 'manual' && adjustingIdx >= 0 ? 'move'
+            touchAction: 'none',
+            cursor: mode === 'manual' && draggingIdx >= 0 ? 'grabbing'
+                    : mode === 'manual' && manualPoints.length < 3 ? 'crosshair'
                     : mode === 'manual' ? 'pointer'
                     : 'default'
           }}
-          onClick={handleCanvasClick}
         />
         
         {!imageSrc && (
@@ -547,7 +622,7 @@ export default function App() {
             <span
               key={i}
               className={`px-3 py-1 rounded-full font-medium transition-all ${
-                i === adjustingIdx
+                i === draggingIdx
                   ? 'bg-yellow-100 text-yellow-700 border border-yellow-400 ring-2 ring-yellow-300'
                   : i < manualPoints.length
                   ? 'bg-green-100 text-green-700 border border-green-300'
@@ -559,14 +634,6 @@ export default function App() {
               {label}
             </span>
           ))}
-          {adjustingIdx >= 0 && (
-            <button
-              onClick={() => { setAdjustingIdx(-1); setStatus('测量完成！可点击已有点进行微调'); }}
-              className="px-3 py-1 rounded-full font-medium text-red-600 bg-red-50 border border-red-200 hover:bg-red-100 active:scale-95 transition-all"
-            >
-              ✕ 取消微调
-            </button>
-          )}
         </div>
       )}
 
