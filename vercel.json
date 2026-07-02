@@ -1,7 +1,0 @@
-{
-  "rewrites": [
-    { "source": "/opencv.js", "destination": "/opencv.js" },
-    { "source": "/assets/(.*)", "destination": "/assets/$1" },
-    { "source": "/(.*)", "destination": "/index.html" }
-  ]
-}
