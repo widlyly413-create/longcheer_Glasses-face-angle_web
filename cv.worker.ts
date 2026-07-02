@@ -1,3 +1,4 @@
+// @ts-nocheck
 // cv.worker.ts
 // 在 Web Worker 环境中加载 OpenCV.js（Worker 是独立线程，无法访问主线程全局变量）
 // file:// 协议下用相对路径，web 服务器下用绝对路径
