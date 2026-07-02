@@ -1,9 +1,9 @@
-import { defineConfig } from 'vite';
-import react from '@vitejs/plugin-react';
+import { defineConfig } from 'vite'
+import react from '@vitejs/react-plugin'
 
 export default defineConfig({
   plugins: [react()],
   worker: {
-    format: 'iife', // 经典 Worker 格式，支持 importScripts 加载 OpenCV.js
+    format: 'es' // 必须配置，让 Worker 支持现代 ES 语法
   }
-});
+})

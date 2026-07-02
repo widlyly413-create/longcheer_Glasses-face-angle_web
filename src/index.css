@@ -1,0 +1,9 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 你也可以在这里加一些针对手机端的基础防抖、防蓝光选中的全局保护 */
+body {
+  margin: 0;
+  -webkit-tap-highlight-color: transparent; /* 去除手机端点击按钮时的蓝色闪烁闪屏 */
+}

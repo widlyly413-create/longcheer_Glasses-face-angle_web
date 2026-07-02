@@ -1,22 +1,32 @@
 {
   "compilerOptions": {
-    "target": "ES2020",
+    "target": "ESNext",
     "useDefineForClassFields": true,
-    "lib": ["ES2020", "DOM", "DOM.Iterable", "WebWorker"],
+    "lib": [
+      "DOM", 
+      "DOM.Iterable", 
+      "ESNext", 
+      "WebWorker"  // 👈 【极其重要】加入 WebWorker 类型定义，否则 importScripts 会报错
+    ],
+    "allowJs": true,
+    "skipLibCheck": true, // 👈 跳过所有第三方库的类型检查，防止 heic2any 或 opencv 导致编译中断
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
     "module": "ESNext",
-    "skipLibCheck": true,
-    "moduleResolution": "bundler",
-    "allowImportingTsExtensions": true,
+    "moduleResolution": "Node",
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
-    "jsx": "react-jsx",
-    "strict": true,
-    "noUnusedLocals": false,
-    "noUnusedParameters": false,
-    "noFallthroughCasesInSwitch": true,
-    "allowJs": false,
-    "forceConsistentCasingInFileNames": true
+    "jsx": "react-jsx" // 👈 激活 React JSX 语法解析
   },
-  "include": ["*.ts", "*.tsx"]
+  "include": [
+    "src" // 👈 告诉编译器只扫描并保护 src 目录下的 tsx 和 ts 文件
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "public" // 👈 排除 public 目录，防止编译器去检查庞大的 opencv.js 导致内存溢出
+  ]
 }
