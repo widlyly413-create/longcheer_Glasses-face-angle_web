@@ -1,5 +1,6 @@
 import React, { useState, useRef, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
+// @ts-ignore heic2any 无内置 TS 类型声明
 import heic2any from 'heic2any';
 
 // ============================================================
